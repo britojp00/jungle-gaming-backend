@@ -1,0 +1,31 @@
+﻿# Dependências
+node_modules/
+
+# Build e cobertura
+dist/
+coverage/
+*.tsbuildinfo
+
+# Variáveis de ambiente e segredos
+.env
+.env.*
+!.env.example
+
+# Logs
+*.log
+npm-debug.log*
+bun-debug.log*
+
+# Testes e ferramentas
+.nyc_output/
+.vitest/
+.cache/
+
+# Sistema operacional e editor
+.DS_Store
+Thumbs.db
+.vscode/*
+!.vscode/extensions.json
+
+# Diretório temporário de scaffold
+jungle-gaming-backend-scaffold/
