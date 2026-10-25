@@ -1,0 +1,66 @@
+# Ambiente de INTEGRAÇÃO — independente do compose.yaml de desenvolvimento.
+#
+# Isolamento: containeres, volumes e portas próprios. As portas ficam
+# amarradas a 127.0.0.1 (não são expostas publicamente) e usam números
+# diferentes dos de dev (5432 / 4566), então os dois ambientes convivem.
+#
+#   Subir:    docker compose -p jungle-gaming-integration -f compose.integration.yaml up -d --wait
+#   Executar: bun run test:integration
+#   Encerrar: docker compose -p jungle-gaming-integration -f compose.integration.yaml down
+#
+# `down` (sem -v) preserva o estado. `down -v` remove APENAS os volumes
+# deste projeto, prefixados por "jungle-gaming-integration_" — nunca os de
+# desenvolvimento. Nenhum comando daqui toca no banco nem nas filas de dev.
+#
+# O LocalStack de integração não usa init-queues.sh: a própria suíte cria e
+# confere a sua fila, garantindo que filas de teste e de dev nunca se misturem.
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    container_name: jungle-gaming-integration-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${INTEGRATION_POSTGRES_DB:-wagering_integration}
+      POSTGRES_USER: ${INTEGRATION_POSTGRES_USER:-wagering_integration}
+      POSTGRES_PASSWORD: ${INTEGRATION_POSTGRES_PASSWORD:-integration_only_change_me}
+    ports:
+      - "127.0.0.1:5433:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -U ${INTEGRATION_POSTGRES_USER:-wagering_integration} -d ${INTEGRATION_POSTGRES_DB:-wagering_integration}",
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  localstack:
+    image: localstack/localstack:4
+    container_name: jungle-gaming-integration-localstack
+    restart: unless-stopped
+    environment:
+      SERVICES: sqs
+      AWS_DEFAULT_REGION: ${AWS_REGION:-us-east-1}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-test}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-test}
+    ports:
+      - "127.0.0.1:4567:4566"
+    volumes:
+      - localstack_data:/var/lib/localstack
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "curl -fsS http://localhost:4566/_localstack/health >/dev/null",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  postgres_data:
+  localstack_data:

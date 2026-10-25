@@ -11,6 +11,7 @@ Antes de implementar um requisito, consulte o README oficial e a documentação 
 - `PLAN.md`: etapas e prioridades de implementação.
 - `ARCHITECTURE.md`: decisões, invariantes, trade-offs e limitações.
 - `ACCEPTANCE_CHECKLIST.md`: requisitos a validar antes da entrega.
+- `PROGRESS.md`: cronologia do trabalho, decisões, problemas resolvidos e validações executadas.
 
 Mantenha esses documentos atualizados quando decisões ou comandos mudarem.
 
