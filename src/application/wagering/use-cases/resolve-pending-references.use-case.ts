@@ -417,7 +417,9 @@ export class ResolvePendingReferencesUseCase {
         const alreadyReversed = await txEm.findOne(WagerTransactionEntity, {
           providerId: entity.providerId!,
           referenceExternalTransactionId: entity.referenceExternalTransactionId!,
-          kind: domain.kind,
+          kind: {
+            $in: [WagerTransactionKind.REFUND, WagerTransactionKind.ROLLBACK],
+          },
           status: WagerTransactionStatus.PROCESSED,
         });
 

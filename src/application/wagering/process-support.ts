@@ -6,6 +6,7 @@ import { FailureCode } from '../../domain/wagering/failure-code.js';
 import { LedgerDirection } from '../../infrastructure/persistence/entities/wallet-ledger-entry.entity.js';
 import {
   WagerTransaction,
+  WagerTransactionKind,
   WagerTransactionStatus,
 } from '../../domain/wagering/wager-transaction.js';
 import { WagerTransactionEntity } from '../../infrastructure/persistence/entities/wager-transaction.entity.js';
@@ -372,8 +373,27 @@ export function evaluateReversal(input: {
   walletBalance: Money;
   alreadyReversed: boolean;
 }): ReversalEvaluation {
-  // Regra 3: `REFUND` só reverte `BET`; `ROLLBACK` reverte `BET`, `WIN` ou
-  // `REFUND`. O domínio recusa os demais kinds e decide a direção.
+  // Regra 3 + tabela do §7: a referência precisa ser uma transação APLICADA
+  // (`PROCESSED`) e do tipo que a operação pode reverter — `REFUND` só reverte
+  // `BET`; `ROLLBACK` reverte `BET`, `WIN` ou `REFUND`. Referência rejeitada,
+  // pendente ou falha nunca moveu dinheiro e não é alvo elegível.
+  const eligibleTarget =
+    input.target.status === WagerTransactionStatus.PROCESSED &&
+    (input.reversal.kind === WagerTransactionKind.REFUND
+      ? input.target.kind === WagerTransactionKind.BET
+      : input.target.kind === WagerTransactionKind.BET ||
+        input.target.kind === WagerTransactionKind.WIN ||
+        input.target.kind === WagerTransactionKind.REFUND);
+
+  if (!eligibleTarget) {
+    return {
+      outcome: 'reject',
+      failureCode: FailureCode.REFERENCE_MISMATCH,
+    };
+  }
+
+  // Regra 3: o domínio decide a direção (inverso da referência para
+  // `ROLLBACK`) e recusa os demais kinds.
   let direction: LedgerDirection;
 
   try {
@@ -393,7 +413,10 @@ export function evaluateReversal(input: {
     };
   }
 
-  // Regra 4: uma referência não é revertida duas vezes pelo mesmo tipo.
+  // Regra 4 (ampliada): uma transação não recebe mais de UMA reversão
+  // processada, **independentemente do tipo** — `REFUND` e `ROLLBACK` da mesma
+  // referência não podem se somar. Continua permitido reverter um `REFUND`
+  // elegível com `ROLLBACK`: aí a referência é o próprio `REFUND`.
   if (input.alreadyReversed) {
     return {
       outcome: 'reject',

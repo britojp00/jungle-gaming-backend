@@ -504,3 +504,321 @@ describe('Reversões pendentes (§7.1) aplicam as regras 3/4/5/9', () => {
     expect(ledger).toHaveLength(3); // abertura + WIN + ROLLBACK
   });
 });
+
+describe('Integridade das reversões (§7, regras 3 e 4)', () => {
+  it('REFUND de WIN, LOSS ou REFUND é inelegível e não move saldo', async () => {
+    const playerId = `it-refund-ineligible-${randomUUID()}`;
+    const wallet = await openWallet(playerId, '100.00');
+
+    await bet(wallet.id, playerId, '10.00', `bet-${randomUUID()}`);
+    await win(wallet.id, playerId, '25.00', `win-target-${randomUUID()}`);
+
+    const wins = (await orm.em.getConnection().execute(
+      `select external_transaction_id from wager_transactions where kind = 'WIN'`,
+    )) as Array<{ external_transaction_id: string }>;
+    const winExternal = wins[0]!.external_transaction_id;
+
+    // REFUND de uma WIN: a regra 3 diz "só referencia BET".
+    const refundWin = await reversal(
+      WagerTransactionKind.REFUND,
+      wallet.id,
+      playerId,
+      '25.00',
+      winExternal,
+    );
+    expect(refundWin.status).toBe('REJECTED');
+    expect(refundWin.failureCode).toBe(FailureCode.REFERENCE_MISMATCH);
+    expect(await balanceOf(wallet.id)).toBe('115.00');
+
+    // REFUND de um LOSS: idem.
+    await new ProcessLossUseCase(em()).execute({
+      walletId: wallet.id,
+      playerId,
+      providerId: 'provider-a',
+      externalTransactionId: 'loss-target',
+      idempotencyKey: 'key-loss-target',
+      amount: '5.00',
+      currency: 'BRL',
+      roundId: 'round-987',
+      gameId: 'fortune-chimp',
+    });
+
+    const refundLoss = await reversal(
+      WagerTransactionKind.REFUND,
+      wallet.id,
+      playerId,
+      '5.00',
+      'loss-target',
+    );
+    expect(refundLoss.status).toBe('REJECTED');
+    expect(refundLoss.failureCode).toBe(FailureCode.REFERENCE_MISMATCH);
+    expect(await balanceOf(wallet.id)).toBe('115.00');
+  });
+
+  it('referência que não está PROCESSED é inelegível (rejeitada ou pendente)', async () => {
+    const playerId = `it-refund-rejected-${randomUUID()}`;
+    const wallet = await openWallet(playerId, '100.00');
+
+    // BET rejeitada por saldo insuficiente: nunca moveu dinheiro.
+    const rejectedBet = await bet(wallet.id, playerId, '500.00', 'bet-rejected');
+    expect(rejectedBet.status).toBe('REJECTED');
+    expect(await balanceOf(wallet.id)).toBe('100.00');
+
+    const refund = await reversal(
+      WagerTransactionKind.REFUND,
+      wallet.id,
+      playerId,
+      '500.00',
+      'bet-rejected',
+    );
+    expect(refund.status).toBe('REJECTED');
+    expect(refund.failureCode).toBe(FailureCode.REFERENCE_MISMATCH);
+
+    const rollback = await reversal(
+      WagerTransactionKind.ROLLBACK,
+      wallet.id,
+      playerId,
+      '500.00',
+      'bet-rejected',
+    );
+    expect(rollback.status).toBe('REJECTED');
+    expect(rollback.failureCode).toBe(FailureCode.REFERENCE_MISMATCH);
+
+    expect(await balanceOf(wallet.id)).toBe('100.00');
+  });
+
+  it('uma transação não recebe duas reversões processadas (REFUND + ROLLBACK)', async () => {
+    const playerId = `it-double-reversal-${randomUUID()}`;
+    const wallet = await openWallet(playerId, '100.00');
+    await bet(wallet.id, playerId, '30.00', 'bet-double');
+
+    const refunded = await reversal(
+      WagerTransactionKind.REFUND,
+      wallet.id,
+      playerId,
+      '30.00',
+      'bet-double',
+    );
+    expect(refunded.status).toBe('PROCESSED');
+    expect(await balanceOf(wallet.id)).toBe('100.00');
+
+    // O ROLLBACK da mesma BET não pode somar um segundo crédito.
+    const rollback = await reversal(
+      WagerTransactionKind.ROLLBACK,
+      wallet.id,
+      playerId,
+      '30.00',
+      'bet-double',
+    );
+    expect(rollback.status).toBe('REJECTED');
+    expect(rollback.failureCode).toBe(FailureCode.REFERENCE_ALREADY_REVERSED);
+    expect(await balanceOf(wallet.id)).toBe('100.00');
+  });
+
+  it('continua permitido reverter um REFUND elegível com ROLLBACK', async () => {
+    const playerId = `it-rollback-refund-${randomUUID()}`;
+    const wallet = await openWallet(playerId, '100.00');
+    await bet(wallet.id, playerId, '30.00', 'bet-chain');
+
+    const refundExternal = `refund-${randomUUID()}`;
+    const refunded = await reversal(
+      WagerTransactionKind.REFUND,
+      wallet.id,
+      playerId,
+      '30.00',
+      'bet-chain',
+      refundExternal,
+    );
+    expect(refunded.status).toBe('PROCESSED');
+    expect(await balanceOf(wallet.id)).toBe('100.00');
+
+    // Aqui a REFERÊNCIA é o próprio REFUND (outra chave): reverter o
+    // reembolso é permitido e debita o mesmo valor.
+    const undone = await reversal(
+      WagerTransactionKind.ROLLBACK,
+      wallet.id,
+      playerId,
+      '30.00',
+      refundExternal,
+    );
+    expect(undone.status).toBe('PROCESSED');
+    expect(await balanceOf(wallet.id)).toBe('70.00');
+  });
+
+  it('o worker §7.1 também recusa referência inelegível', async () => {
+    const playerId = `it-pending-ineligible-${randomUUID()}`;
+    const wallet = await openWallet(playerId, '100.00');
+
+    // A reversão nasce pendente (referência ausente)…
+    const pending = await new ProcessReversalUseCase(em()).execute({
+      kind: WagerTransactionKind.REFUND,
+      walletId: wallet.id,
+      playerId,
+      providerId: 'provider-a',
+      externalTransactionId: `rev-${randomUUID()}`,
+      idempotencyKey: `key-${randomUUID()}`,
+      amount: '30.00',
+      currency: 'BRL',
+      roundId: 'round-987',
+      gameId: 'fortune-chimp',
+      referenceExternalTransactionId: 'bet-rejected-late',
+    } as ProcessReversalInput);
+    expect(pending.status).toBe('PENDING_REFERENCE');
+
+    // …e a referência que chega está REJECTED: nunca moveu dinheiro.
+    const rejectedBet = await bet(
+      wallet.id,
+      playerId,
+      '500.00',
+      'bet-rejected-late',
+    );
+    expect(rejectedBet.status).toBe('REJECTED');
+
+    const cycle = await new ResolvePendingReferencesUseCase(em()).execute({
+      now: new Date(),
+    });
+    expect(cycle.rejected).toBe(1);
+    expect(await balanceOf(wallet.id)).toBe('100.00');
+
+    const rows = (await orm.em.getConnection().execute(
+      `select status, rejection_reason from wager_transactions where kind = 'REFUND'`,
+    )) as Array<{ status: string; rejection_reason: string }>;
+    expect(rows[0]).toMatchObject({
+      status: 'REJECTED',
+      rejection_reason: 'REFERENCE_MISMATCH',
+    });
+  });
+
+  it('REFUND e ROLLBACK concorrentes da mesma referência: só um aplica', async () => {
+    const playerId = `it-concurrent-mixed-${randomUUID()}`;
+    const wallet = await openWallet(playerId, '100.00');
+    await bet(wallet.id, playerId, '30.00', 'bet-mixed');
+
+    const attempts = await Promise.allSettled([
+      reversal(WagerTransactionKind.REFUND, wallet.id, playerId, '30.00', 'bet-mixed'),
+      reversal(WagerTransactionKind.ROLLBACK, wallet.id, playerId, '30.00', 'bet-mixed'),
+    ]);
+
+    const applied = attempts.filter(
+      (attempt) =>
+        attempt.status === 'fulfilled' && attempt.value.status === 'PROCESSED',
+    );
+
+    // A garantia é do banco (índice único por referência, não por tipo).
+    expect(applied).toHaveLength(1);
+    expect(await balanceOf(wallet.id)).toBe('100.00');
+
+    // A tentativa perdedora fica registrada como REJECTED auditável, sem
+    // efeito financeiro.
+    const rejected = (await orm.em.getConnection().execute(
+      `select status, rejection_reason from wager_transactions
+        where kind in ('REFUND','ROLLBACK') and status = 'REJECTED'`,
+    )) as Array<{ status: string; rejection_reason: string }>;
+    expect(rejected).toHaveLength(1);
+    expect(rejected[0]!.rejection_reason).toBe('REFERENCE_ALREADY_REVERSED');
+  });
+
+  it('o replay da requisição perdedora responde como a primeira chamada', async () => {
+    const playerId = `it-replay-loser-${randomUUID()}`;
+    const wallet = await openWallet(playerId, '100.00');
+    await bet(wallet.id, playerId, '30.00', 'bet-replay-loser');
+
+    // A primeira tentativa perde para uma reversão já aplicada.
+    await reversal(
+      WagerTransactionKind.REFUND,
+      wallet.id,
+      playerId,
+      '30.00',
+      'bet-replay-loser',
+      'winner-1',
+    );
+
+    const losingKey = `key-loser-${randomUUID()}`;
+    const lost = await new ProcessReversalUseCase(em()).execute({
+      kind: WagerTransactionKind.ROLLBACK,
+      walletId: wallet.id,
+      playerId,
+      providerId: 'provider-a',
+      externalTransactionId: `rev-${randomUUID()}`,
+      idempotencyKey: losingKey,
+      amount: '30.00',
+      currency: 'BRL',
+      roundId: 'round-987',
+      gameId: 'fortune-chimp',
+      referenceExternalTransactionId: 'bet-replay-loser',
+    } as ProcessReversalInput);
+
+    expect(lost.status).toBe('REJECTED');
+    expect(lost.failureCode).toBe(FailureCode.REFERENCE_ALREADY_REVERSED);
+    expect(lost.replayed).toBe(false);
+
+    // Requisição idêntica: MESMA resposta de domínio/status (§9).
+    const replay = await new ProcessReversalUseCase(em()).execute({
+      kind: WagerTransactionKind.ROLLBACK,
+      walletId: wallet.id,
+      playerId,
+      providerId: 'provider-a',
+      externalTransactionId: lost.transactionId
+        ? ((
+            await orm.em.getConnection().execute(
+              `select external_transaction_id from wager_transactions where id = '${lost.transactionId}'`,
+            )
+          ) as Array<{ external_transaction_id: string }>)[0]!.external_transaction_id
+        : '',
+      idempotencyKey: losingKey,
+      amount: '30.00',
+      currency: 'BRL',
+      roundId: 'round-987',
+      gameId: 'fortune-chimp',
+      referenceExternalTransactionId: 'bet-replay-loser',
+    } as ProcessReversalInput);
+
+    expect(replay.status).toBe('REJECTED');
+    expect(replay.failureCode).toBe(FailureCode.REFERENCE_ALREADY_REVERSED);
+    expect(replay.transactionId).toBe(lost.transactionId);
+    expect(await balanceOf(wallet.id)).toBe('100.00');
+  });
+
+  it('duas requisições com a mesma chave de idempotência não duplicam registros', async () => {
+    const playerId = `it-same-key-${randomUUID()}`;
+    const wallet = await openWallet(playerId, '100.00');
+    await bet(wallet.id, playerId, '30.00', 'bet-same-key');
+
+    const key = `key-same-${randomUUID()}`;
+    const external = `rev-${randomUUID()}`;
+    const body = {
+      kind: WagerTransactionKind.REFUND,
+      walletId: wallet.id,
+      playerId,
+      providerId: 'provider-a',
+      externalTransactionId: external,
+      idempotencyKey: key,
+      amount: '30.00',
+      currency: 'BRL',
+      roundId: 'round-987',
+      gameId: 'fortune-chimp',
+      referenceExternalTransactionId: 'bet-same-key',
+    } as ProcessReversalInput;
+
+    const attempts = await Promise.allSettled([
+      new ProcessReversalUseCase(em()).execute(body),
+      new ProcessReversalUseCase(em()).execute(body),
+    ]);
+
+    // No máximo uma aplica; a outra (se houver) é replay do mesmo resultado.
+    const applied = attempts.filter(
+      (attempt) =>
+        attempt.status === 'fulfilled' &&
+        attempt.value.status === 'PROCESSED' &&
+        attempt.value.replayed === false,
+    );
+    expect(applied.length).toBeLessThanOrEqual(1);
+
+    // A unique de idempotência impede duplicidade de registro.
+    const rows = (await orm.em.getConnection().execute(
+      `select id from wager_transactions where idempotency_key = '${key}'`,
+    )) as Array<{ id: string }>;
+    expect(rows).toHaveLength(1);
+    expect(await balanceOf(wallet.id)).toBe('100.00');
+  });
+});

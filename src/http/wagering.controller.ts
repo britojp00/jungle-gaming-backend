@@ -115,14 +115,16 @@ export class WageringController {
     const result = await this.dispatch(data, base);
 
     // README §9: o status distingue aceite com processamento pendente (202),
-    // rejeição por regra de negócio (422) e sucesso (200) — sempre igual em
-    // qualquer endpoint.
+    // rejeição por regra de negócio (422), conflito de reversão já aplicada
+    // (409) e sucesso (200) — sempre igual em qualquer endpoint.
     res.status(
-      result.status === 'PENDING_REFERENCE'
-        ? HttpStatus.ACCEPTED
-        : result.status === 'REJECTED'
-          ? HttpStatus.UNPROCESSABLE_ENTITY
-          : HttpStatus.OK,
+      result.failureCode === 'REFERENCE_ALREADY_REVERSED'
+        ? HttpStatus.CONFLICT
+        : result.status === 'PENDING_REFERENCE'
+          ? HttpStatus.ACCEPTED
+          : result.status === 'REJECTED'
+            ? HttpStatus.UNPROCESSABLE_ENTITY
+            : HttpStatus.OK,
     );
 
     // `{ transactionId, status, balance, idempotentReplay }` — `failureCode`

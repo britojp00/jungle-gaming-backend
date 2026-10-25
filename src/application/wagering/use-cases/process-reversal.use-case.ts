@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 
+import { Logger } from '@nestjs/common';
 import {
   EntityManager,
   UniqueConstraintViolationException,
@@ -64,6 +65,8 @@ export interface ProcessReversalInput {
  * - **regra 6/7**: rejeição não move saldo; replay devolve o resultado.
  */
 export class ProcessReversalUseCase {
+  private readonly logger = new Logger(ProcessReversalUseCase.name);
+
   constructor(private readonly em: EntityManager) {}
 
   async execute(input: ProcessReversalInput): Promise<WagerProcessResult> {
@@ -102,38 +105,7 @@ export class ProcessReversalUseCase {
 
     const now = new Date();
 
-    const reversal =
-      input.kind === WagerTransactionKind.REFUND
-        ? WagerTransaction.createRefund({
-            id: randomUUID(),
-            walletId: input.walletId,
-            playerId: input.playerId,
-            providerId: input.providerId,
-            externalTransactionId: input.externalTransactionId,
-            idempotencyKey: input.idempotencyKey,
-            payloadHash,
-            roundId: input.roundId,
-            gameId: input.gameId,
-            money: amount,
-            referenceExternalTransactionId:
-              input.referenceExternalTransactionId,
-            createdAt: now,
-          })
-        : WagerTransaction.createRollback({
-            id: randomUUID(),
-            walletId: input.walletId,
-            playerId: input.playerId,
-            providerId: input.providerId,
-            externalTransactionId: input.externalTransactionId,
-            idempotencyKey: input.idempotencyKey,
-            payloadHash,
-            roundId: input.roundId,
-            gameId: input.gameId,
-            money: amount,
-            referenceExternalTransactionId:
-              input.referenceExternalTransactionId,
-            createdAt: now,
-          });
+    const reversal = this.buildReversal(input, payloadHash, now);
 
     return this.em
       .transactional(async (txEm) => {
@@ -252,10 +224,15 @@ export class ProcessReversalUseCase {
 
         // Regras 3, 4, 5 e 9 — o MESMO julgamento que o worker de §7.1 aplica
         // quando a reversão nasce pendente e é resolvida depois.
+        // Regra 4 ampliada: a referência não recebe mais de UMA reversão
+        // processada, independentemente do tipo (REFUND ou ROLLBACK). Só
+        // reversões contam — a WIN que referencia a mesma BET não é reversão.
         const alreadyReversed = await txEm.findOne(WagerTransactionEntity, {
           providerId: input.providerId,
           referenceExternalTransactionId: input.referenceExternalTransactionId,
-          kind: input.kind,
+          kind: {
+            $in: [WagerTransactionKind.REFUND, WagerTransactionKind.ROLLBACK],
+          },
           status: WagerTransactionStatus.PROCESSED,
         });
 
@@ -352,13 +329,29 @@ export class ProcessReversalUseCase {
         return toProcessResult(transaction, false);
       })
       .catch(async (error) => {
-        // Regra 4 garantida pelo banco: a unique `wager_transactions_reversal_unique`
-        // impede até registrar uma segunda reversão da mesma referência.
+        // Regra 4 garantida pelo banco: a unique
+        // `wager_transactions_reversal_unique` impede duas reversões
+        // PROCESSADAS da mesma referência. Aqui a transação financeira já foi
+        // revertida por inteiro — o conflito vira uma linha `REJECTED` de
+        // auditoria, gravada em transação própria, e a resposta continua
+        // sendo de conflito (409).
         if (
           error instanceof UniqueConstraintViolationException &&
           String(error.message).includes('wager_transactions_reversal_unique')
         ) {
-          throw new Error('REFERENCE_ALREADY_REVERSED');
+          const audit = await this.recordReversalConflict(
+            input,
+            payloadHash,
+            now,
+          );
+
+          if (!audit) {
+            // Sem auditoria persistida não há resultado de domínio: o
+            // conflito continua sendo reportado como erro (409).
+            throw new Error('REFERENCE_ALREADY_REVERSED');
+          }
+
+          return toProcessResult(audit, false);
         }
 
         if (error instanceof UniqueConstraintViolationException) {
@@ -376,6 +369,84 @@ export class ProcessReversalUseCase {
 
         throw error;
       });
+  }
+
+  /** Constrói o domínio da reversão (mesmo payload para auditoria e efeito). */
+  private buildReversal(
+    input: ProcessReversalInput,
+    payloadHash: string,
+    now: Date,
+  ): WagerTransaction {
+    const props = {
+      id: randomUUID(),
+      walletId: input.walletId,
+      playerId: input.playerId,
+      providerId: input.providerId,
+      externalTransactionId: input.externalTransactionId,
+      idempotencyKey: input.idempotencyKey,
+      payloadHash,
+      roundId: input.roundId,
+      gameId: input.gameId,
+      money: Money.from({ amount: input.amount, currency: input.currency }),
+      referenceExternalTransactionId: input.referenceExternalTransactionId,
+      createdAt: now,
+    };
+
+    return input.kind === WagerTransactionKind.REFUND
+      ? WagerTransaction.createRefund(props)
+      : WagerTransaction.createRollback(props);
+  }
+
+  /**
+   * Auditoria do conflito de regra 4 (§7): a tentativa que perdeu a disputa
+   * do índice único vira uma linha `REJECTED` com
+   * `REFERENCE_ALREADY_REVERSED`, gravada numa transação PRÓPRIA — a
+   * transação financeira que falhou já foi revertida por inteiro, então aqui
+   * não há saldo, ledger nem outbox além do evento de rejeição.
+   *
+   * Melhor esforço: se a auditoria não puder ser gravada (banco indisponível,
+   * ou outra tentativa idêntica já a gravou — unique de idempotência), o
+   * conflito continua sendo reportado e a falha vai para o log. Nunca se
+   * afirma que a auditoria persistiu quando não persistiu.
+   */
+  private async recordReversalConflict(
+    input: ProcessReversalInput,
+    payloadHash: string,
+    now: Date,
+  ): Promise<WagerTransactionEntity | null> {
+    try {
+      return await this.em.transactional(async (txEm) => {
+        const wallet = await new WalletRepository(txEm).findByIdForUpdate(
+          input.walletId,
+        );
+
+        if (!wallet) {
+          throw new Error('WALLET_NOT_FOUND');
+        }
+
+        const conflict = this.buildReversal(input, payloadHash, now);
+        conflict.reject(FailureCode.REFERENCE_ALREADY_REVERSED);
+
+        const entity = toTransactionEntity(conflict, wallet, txEm);
+        txEm.persist(entity);
+        this.persistRejectedEvent(txEm, entity, input, now);
+        await txEm.flush();
+
+        return entity;
+      });
+    } catch (error) {
+      this.logger.error(
+        `auditoria do conflito de reversão não persistida: ${JSON.stringify({
+          providerId: input.providerId,
+          externalTransactionId: input.externalTransactionId,
+          referenceExternalTransactionId: input.referenceExternalTransactionId,
+          kind: input.kind,
+          detail: error instanceof Error ? error.message : String(error),
+        })}`,
+      );
+
+      return null;
+    }
   }
 
   private persistRejectedEvent(
