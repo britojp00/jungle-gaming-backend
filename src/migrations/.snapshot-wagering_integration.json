@@ -1060,8 +1060,7 @@
         {
           "columnNames": [
             "provider_id",
-            "reference_external_transaction_id",
-            "kind"
+            "reference_external_transaction_id"
           ],
           "composite": true,
           "constraint": false,
