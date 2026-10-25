@@ -31,8 +31,8 @@ Processar apostas e resultados com precisão monetária, concorrência segura, i
 - `PROGRESS.md` — cronologia do que foi feito, decisões, problemas e validações.
 
 ## Estado atual da implementação
-O desafio especifica uma API completa de apostas. **Isto ainda não está
-pronto.** O que existe hoje é o núcleo financeiro transacional:
+O desafio está implementado de ponta a ponta: API HTTP (§9), processamento
+financeiro (§7), mensageria (§10/§11) e recuperação após falhas.
 
 | Área | Estado |
 |---|---|
@@ -43,20 +43,19 @@ pronto.** O que existe hoje é o núcleo financeiro transacional:
 | Aposta (`ProcessBetUseCase`) | implementado e integrado ao domínio (`WagerTransaction.createBet`); `roundId`/`gameId` obrigatórios na entrada; validado contra PostgreSQL real, incluindo cenários de concorrência |
 | Prêmio (`ProcessWinUseCase`) | implementado com a política de referência decidida: crédito imediato sem referência; `PENDING_REFERENCE` + evento `WagerTransactionPendingReference` quando o alvo não existe; `REFERENCE_MISMATCH` em divergência de vínculo; replay não resolve referência; validado em PostgreSQL real, inclusive com rollback provocado |
 | Worker de referências pendentes (§7.1) | implementado: backoff exponencial (5 s × 2^(n−1), teto 15 min), 10 tentativas e TTL de 6 h, claim `FOR UPDATE SKIP LOCKED`, rejeição atômica `REFERENCE_NOT_FOUND`; validado em PostgreSQL real com 2 instâncias concorrentes e crashes |
-| LOSS, REFUND, ROLLBACK | **domínio implementado e testado; sem casos de uso nem HTTP** |
-| Endpoints HTTP | **nenhum** |
+| LOSS, REFUND, ROLLBACK | implementados com as regras do §7: a referência precisa estar `PROCESSED`, `REFUND` só reverte `BET`, `ROLLBACK` reverte `BET`/`WIN`/`REFUND` e cada referência recebe no máximo **uma** reversão processada; a disputa de concorrência vira linha `REJECTED` de auditoria. Validado em PostgreSQL real, inclusive entre processos independentes |
+| Endpoints HTTP (§9) | implementados: 7 rotas de negócio (`POST /wallets`, `GET /wallets/:walletId`, `GET /wallets/:walletId/ledger`, `POST /wallets/:walletId/reconciliation`, `POST /wagering/transactions`, `GET /wagering/transactions/:transactionId`, `GET /providers/:providerId/wagering/transactions/:externalTransactionId`) + 2 de health, com mapeamento único de status (200/202/400/404/409/422/503) |
 | Publisher da outbox (§11) | implementado: o worker lê `outbox_messages`, publica em SQS e marca `PUBLISHED`; claim `FOR UPDATE SKIP LOCKED` com tentativa e janela gravadas antes de publicar, retentativas limitadas com backoff e desligamento gracioso; validado em PostgreSQL e LocalStack reais |
-| Inbox, consumer SQS, DLQ | **não implementados** (o retry/backoff da publicação da outbox está implementado e testado) |
-| Logs, métricas, liveness/readiness | **não implementados** |
+| Inbox, consumer SQS, DLQ | implementados: Inbox persistente por `messageId`, Inbox + efeitos + ledger + outbox em uma única transação, ACK só após o commit, DLQ em erro permanente e por `maxReceiveCount`; redelivery não duplica efeitos (validado entre processos) |
+| Liveness/readiness | implementados (`/health/live`, `/health/ready` com PostgreSQL e SQS); **métricas (§12) não implementadas** |
 
 Ter tabela, enum ou constraint prontos **não** significa que o fluxo de
 negócio está concluído. O detalhamento está em `PLAN.md` e
 `ACCEPTANCE_CHECKLIST.md`.
 
-**Importante:** nenhum trabalho desde a fundação está commitado. Todo o
-conteúdo de `src/domain/`, `src/application/`, `src/infrastructure/`,
-`src/migrations/`, `test/` e dos arquivos de infraestrutura são alterações
-locais não versionadas.
+**Importante:** o estado acima está no commit `5068354`. Há alterações locais
+ainda não commitadas sobre esse commit (regras de reversão do §7, índice único
+por referência e os testes entre processos); `PROGRESS.md` traz a cronologia.
 
 ## Idempotência — algoritmo do `payloadHash` (README §9)
 O README oficial exige que o algoritmo do `payloadHash` esteja documentado.
@@ -88,14 +87,21 @@ diferente (inclusive `kind`) ⇒ hash diferente ⇒ conflito.
 
 ## Estrutura
 ```
-src/domain/          Money, Wallet, WalletLedgerEntry, WagerTransaction (sem NestJS/ORM/SQS)
-src/application/     OpenWalletUseCase, ProcessBetUseCase, ProcessWinUseCase,
-                     ResolvePendingReferencesUseCase (+ process-support, reference-retry-policy)
-src/infrastructure/  entidades e repositórios MikroORM + workers/pending-reference.worker.ts
+src/domain/          Money, Wallet, WalletLedgerEntry, WagerTransaction, InboxMessage
+                     (sem NestJS/ORM/SQS)
+src/application/     casos de uso (wallets, wagering), regras do §7 (process-support),
+                     mensageria (payload do comando, erros do consumidor, publicação)
+src/http/            controllers §9 + health, mapeamento único de status e erros
+src/infrastructure/  entidades e repositórios MikroORM, SQS (cliente, fila de comandos,
+                     publisher da outbox) e workers (referências pendentes, outbox,
+                     consumidor de comandos)
 src/migrations/      Migration20261024021931_InitialSchema (constraints + ledger append-only)
                      Migration20261024150000_PendingReferenceRetry (tentativas, janela e índices do §7.1)
+                     Migration20261025120000_ReversalUniqueProcessed (regra 4 no banco)
+                     Migration20261025160000_ReversalUniquePerReference (uma reversão por referência)
 test/support/        fake de EntityManager (apenas unitários)
-test/integration/    suíte contra PostgreSQL e LocalStack reais
+test/integration/    suíte contra PostgreSQL e LocalStack reais (inclui cenários
+                     entre processos independentes)
 ```
 
 ## Worker de referências pendentes (§7.1)
@@ -239,5 +245,6 @@ A suíte de integração se recusa a rodar se `INTEGRATION_DATABASE_URL` apontar
 para um banco cujo nome não termine em `_integration`, antes de qualquer
 conexão ou `TRUNCATE`. Variáveis e valores ilustrativos: `.env.integration.example`.
 
-Ver `ARCHITECTURE.md` para o que a suíte de integração cobre hoje e o que
-ainda falta para validar a publicação de eventos end-to-end.
+Ver `ARCHITECTURE.md` para a cobertura da suíte de integração e para as
+limitações que permanecem (≥3 processos simultâneos, reinício do serviço,
+observabilidade e o consumidor da fila de eventos).

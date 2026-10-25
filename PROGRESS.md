@@ -5,24 +5,24 @@ pôde ser **reconstruída a partir de evidências nos arquivos** — não de
 histórico Git. Não atribuo datas ou horários que não estejam comprovados.
 
 ## Situação do versionamento
-O repositório tem apenas **três commits**, todos anteriores à implementação:
+O trabalho está versionado — a fundação em `5068354` e a entrega final em
+commits com arquivos explicitamente selecionados:
 
 | Commit | Conteúdo |
 |---|---|
 | `4f507c6` | docs: adiciona planejamento inicial do desafio |
 | `10381ba` | docs: adiciona instrucoes e skills do OpenCode |
 | `e4d61ff` | chore: configura scaffold inicial NestJS com Bun |
+| `5068354` | feat: implement distributed wagering processor (domínio, casos de uso, workers, HTTP, testes) |
+| `9f9b595` | feat(wagering): regras 3/4 do §7 em REFUND/ROLLBACK e auditoria A1 |
+| `f7f9a20` | feat(persistence): índice único de uma reversão processada por referência |
+| `8817fe1` | test(integration): concorrência e redelivery entre processos independentes |
+| (este) | docs: alinha README, plano, arquitetura, checklist e progresso à entrega final |
 
-**Nada da implementação está commitado.** `src/domain/`, `src/application/`,
-`src/infrastructure/`, `src/migrations/`, `test/`, `compose.yaml`,
-`docker/`, `vitest.config.integration.ts`, `compose.integration.yaml` e os
-arquivos `.env.*.example` são alterações locais não versionadas, bem como as
-modificações em `package.json`, `bun.lock`, `.gitignore`, `.env.example` e
-`src/app.module.ts`.
-
-A única data comprovada no corpo da implementação é o nome do arquivo de
-migration `Migration20261024021931` ⇒ 2026-10-24 02:19:31. Todo o trabalho
-descrito abaixo pertence a **2026-10-24**.
+As datas comprovadas no corpo da implementação são os nomes das migrations:
+`Migration20261024021931` ⇒ 2026-10-24 02:19:31 e
+`Migration20261025120000`/`Migration20261025160000` ⇒ 2026-10-25. Todo o
+trabalho descrito abaixo pertence a **2026-10-24/25**.
 
 ---
 
@@ -912,8 +912,9 @@ qualquer falha nada é confirmado — nem a própria Inbox.
 `messageId` do envelope como identidade (com `consumerName` lógico
 `wager-transactions`); `referenceExternalTransactionId` aceito como opcional
 em `data` (o exemplo da §10 omite, §7 exige quando o kind referencia);
-`LOSS`/`REFUND`/`ROLLBACK` → permanente (sem caso de uso); corrida na Inbox
-(violação da única) → ack. Detalhadas em `ARCHITECTURE.md`.
+`LOSS`/`REFUND`/`ROLLBACK` → permanente (sem caso de uso **nesta etapa**;
+desde a etapa final os três têm caso de uso e são despachados normalmente);
+corrida na Inbox (violação da única) → ack. Detalhadas em `ARCHITECTURE.md`.
 
 ### Testes executados nesta etapa
 - **Unitários (22 novos):** envelope (10), caso de uso (5), worker (7).
@@ -929,17 +930,95 @@ inalterado; nenhum commit, `git reset`/`git clean`, reinstalação ou deploy.
 
 ---
 
+## Etapa final — regras de reversão do §7 (F1/F2/F3 + A1/A2), testes entre processos e entrega
+
+Esta etapa fecha a entrega e **também registra trabalho que não teve entrada
+própria na cronologia** (a camada HTTP e os casos de uso de `LOSS`/`REFUND`/
+`ROLLBACK`): os números de "Validações" já os incluíam, mas as decisões não
+haviam sido registradas aqui.
+
+### O que entrou
+- **Camada HTTP (§9)** — `src/http/` com 7 rotas de negócio (`POST /wallets`,
+  `GET /wallets/:walletId`, `GET /wallets/:walletId/ledger`,
+  `POST /wallets/:walletId/reconciliation`, `POST /wagering/transactions`,
+  `GET /wagering/transactions/:transactionId`,
+  `GET /providers/:providerId/wagering/transactions/:externalTransactionId`)
+  mais `/health/live` e `/health/ready`; um único mapeamento de status
+  (400/404/409/422/202/503); controllers sem regra financeira, reutilizando
+  os casos de uso (16 testes de integração).
+- **Casos de uso `LOSS`, `REFUND` e `ROLLBACK`** — `ProcessLossUseCase` e
+  `ProcessReversalUseCase`, com o julgamento centralizado em
+  `evaluateReversal` (`process-support.ts`): regra 1 (referência obrigatória),
+  regra 3 (alvo `PROCESSED` e elegível — `REFUND` só reverte `BET`),
+  regra 5 (valor igual) e regra 4 ampliada (**no máximo uma** reversão
+  processada por referência, seja qual for o tipo). O mesmo julgamento vale
+  para a resolução tardia (worker de §7.1).
+- **A1 — auditoria da corrida:** o perdedor da disputa do índice único vira
+  linha `REJECTED` + `REFERENCE_ALREADY_REVERSED` em transação própria, com
+  evento de rejeição; resposta **409** (primeira chamada e replay). Se a
+  auditoria não puder ser gravada, o conflito continua reportado e a falha vai
+  para o log — nunca se afirma persistência que não aconteceu.
+- **A2 — garantia no banco:** `Migration20261025120000_ReversalUniqueProcessed`
+  e `Migration20261025160000_ReversalUniquePerReference`
+  (`(provider_id, reference_external_transaction_id)` para reversões
+  `PROCESSED`), com `up`/`down` executados e conferidos no banco de integração.
+- **Testes entre processos independentes** —
+  `test/integration/multi-process.integration.e2e-spec.ts` +
+  `test/integration/support/child-runner.ts`: três cenários, cada um com
+  processos `bun` separados (conexões próprias, largada simultânea por
+  `READY`/`GO`):
+  1. §8: duas apostas de `80.00` sobre `100.00` em processos distintos →
+     uma `PROCESSED`, uma `REJECTED`, saldo `20.00`, **um** débito;
+  2. corrida `REFUND` × `ROLLBACK` sobre a mesma referência → uma `PROCESSED`
+     e uma `REJECTED` + auditoria, saldo intacto;
+  3. commit antes do ACK: o processo que consome sai **sem** ack, a mensagem
+     volta por visibilidade e outro processo responde `duplicate` — saldo
+     `75.00`, ledger e outbox íntegros, **um** registro na Inbox.
+
+### Problemas reais encontrados e corrigidos (no harness de teste)
+1. `process.execPath` dentro do Vitest é o **Node** do harness, não o Bun: as
+   crianças passaram a ser lançadas com o `bun` resolvido via `where bun`;
+   `DATABASE_URL` só por ambiente (nenhuma credencial em argv ou log).
+2. A barreira por polling (`setInterval` dentro do executor da Promise) nunca
+   disparava no worker do Vitest/Windows — substituída por leitura do `READY`
+   no `stdout` (event-driven) com prazo externo via `Promise.race`.
+3. As crianças não terminavam depois do `GO`: `process.stdin.resume()`
+   mantinha o loop de eventos vivo — corrigido com `pause()`/`unref()` após a
+   largada.
+4. `receive(…, 0)` (visibilidade zero) expirava o `receipt handle` e o ACK
+   falhava com `HTTP 400` do LocalStack — a reentrega passou a usar janela de
+   30 s.
+
+### Validações desta etapa
+| Comando | Resultado |
+|---|---|
+| `bun run build` | exit 0 |
+| `bun run lint` | exit 0, sem diagnósticos novos |
+| `bunx tsc --noEmit` | exit 0, sem saída |
+| `bun run test` | 258 testes, 22 arquivos — todos passando (exit 0) |
+| `bun run test:integration` | 10 arquivos, 92 testes — passando (exit 0) |
+
+### Limites respeitados nesta etapa
+Migrations executadas **apenas** no banco de integração; nenhum teste
+removido, ignorado nem com asserção enfraquecida; `docs/README-official.md`
+inalterado; nenhum push, `git reset`, `git clean`, reinstalação ou deploy.
+
+---
+
 ## Validações
-Resultados da última execução completa, feita após a etapa do consumidor:
+Resultados da última execução completa, feita na entrega final (após os testes
+entre processos):
 
 | Comando | Resultado |
 |---|---|
-| `bun run test` | 248 testes, 20 arquivos — todos passando (exit 0) |
+| `bun run test` | 258 testes, 22 arquivos — todos passando (exit 0) |
 | `bun run lint` | exit 0, sem diagnósticos |
 | `bunx tsc --noEmit` | exit 0, sem saída |
-| `bun run test:integration` | 9 arquivos, 81 testes — passando (exit 0) |
+| `bun run build` | exit 0 |
+| `bun run test:integration` | 10 arquivos, 92 testes — passando (exit 0) |
 
-Baselines: antes da Fase 13, `bun run test` com 143 testes em 9 arquivos e
+Baselines: antes da entrega final, 248 unitários e 81 de integração (9
+arquivos); antes da Fase 13, `bun run test` com 143 testes em 9 arquivos e
 `bun run test:integration` com 30 testes em 4 arquivos; antes da Fase 12,
 131 testes em 8 arquivos e 20 testes em 3 arquivos; antes da Fase 10,
 124 testes em 8 arquivos e 19 testes em 3 arquivos; antes da Fase 9,
@@ -948,63 +1027,51 @@ Fase 13 somaram 4 unitários e 2 de integração, sem novos arquivos de teste;
 o incremento da outbox somou 21 unitários (2 arquivos novos) e 6 de
 integração (1 arquivo novo); a separação da fila de eventos somou 6
 unitários (1 arquivo novo) e 1 de integração; a etapa do consumidor somou 22
-unitários (3 arquivos novos) e 6 de integração (1 arquivo novo).
+unitários (3 arquivos novos) e 6 de integração (1 arquivo novo); a etapa
+final somou 10 unitários (2 arquivos novos: `process-support.spec.ts` e
+`process-reversal.use-case.spec.ts`), elevou as reversões de 12 para 20
+testes de integração e acrescentou 3 testes entre processos (1 arquivo novo
+mais o runner infantil).
 
-Distribuição atual: 248 unitários (money, wallet, wallet-ledger-entry,
+Distribuição atual: 258 unitários (money, wallet, wallet-ledger-entry,
 wager-transaction, payload-hash, open-wallet, process-bet, process-win,
 **reference-retry-policy**, **resolve-pending-references**,
 **pending-reference.worker**, **publish-outbox-messages**,
 **outbox-publisher.worker**, **sqs-outbox-publisher**,
 **wager-transaction-requested**, **receive-wager-transaction**,
 **wager-command-consumer.worker**, **inbox-message**,
-**inbox-message.repository**, app.controller) + 81 de integração (8
-PostgreSQL + 8 concorrência + 10 WIN + **10 referência pendente** +
-**7 outbox** + **6 consumo de comandos** + 4 SQS + **16 HTTP** +
-**12 reversões**).
+**inbox-message.repository**, **process-support**, **process-reversal**,
+app.controller) + 92 de integração (8 PostgreSQL + 8 concorrência + 10 WIN +
+**10 referência pendente** + **7 outbox** + **6 consumo de comandos** + 4 SQS
++ **16 HTTP** + **20 reversões** + **3 entre processos**).
 
 ## Limitações que permanecem
-1. **Nada commitado** desde a fundação.
-2. **Concorrência entre processos não testada** — a concorrência entre
-   transações/conexões de um único processo está testada em PostgreSQL real
-   (Fase 8), mas ≥3 instâncias simultâneas não foram executadas.
-3. **Eventos não são publicados** — não há publisher nem worker de outbox;
-   confirmar a existência da fila não comprova publicação correta.
-4. **LOSS, REFUND e ROLLBACK como casos de uso** — o domínio (factories,
-   transições, `FailureCode`) existe e está testado; a BET e a **WIN** já
-   têm caso de uso aplicado (Fases 10 e 12). Falta o fluxo dos três kinds
-   de reversão/resultado.
-5. **Eventos nunca publicados** — a outbox é gravada por todos os casos de uso
-   e pelo worker de §7.1, mas não há worker de outbox nem publisher: nada é
-   lido de `outbox_messages` e enviado ao SQS.
-6. **Sem HTTP, worker de outbox, inbox, retries, DLQ, logs e métricas** — o
-   único worker em produção é o de referências pendentes (§7.1).
-7. **Reversão (`down`) da migration inicial nunca executada** — a `down` da
-   `Migration20261024150000_PendingReferenceRetry` já foi executada e
-   conferida (Fase 13).
-8. **Reconciliação saldo ⇄ ledger** existe no domínio e é verificada por SQL
-   nos testes, sem endpoint nem caso de uso em produção.
-9. **Reinício do serviço não testado** (idempotência persiste no banco, mas
-   não há teste de reinício).
+1. **≥3 processos/instâncias simultâneos e reinício do serviço não
+   testados** — a concorrência entre **2 processos independentes** está
+   comprovada (etapa final), assim como a entre transações/conexões de um
+   processo (Fase 8) e entre instâncias dos workers; faltam ≥3 processos ao
+   mesmo tempo e o teste de reinício.
+2. **Observabilidade (§12)** — logs JSON estruturados com IDs de correlação e
+   métricas operacionais não implementados (liveness/readiness estão prontos).
+3. **Consumidor da fila de eventos** da outbox (§11, passo 5) não
+   implementado — quem torna a duplicata de publicação segura do lado dos
+   eventos.
+4. **`WalletRepository.create`** cria wallet sem os registros financeiros
+   obrigatórios e fora de transação — caminho inseguro pendente de decisão.
+5. **Reversão (`down`) da migration inicial nunca executada** — a `down` das
+   outras três já foi executada e conferida no banco de integração.
+6. **`bun run test:e2e`** falha por problema conhecido de configuração do
+   scaffold NestJS (enums em strip-only mode do Node 24).
+7. **SIGTERM não é testado** — o desligamento gracioso está implementado
+   (shutdown hooks + ciclo em andamento aguardado), mas não há teste do sinal.
 
 ## Próximos passos
 Em ordem de dependência (detalhamento em `PLAN.md`):
 
-1. **Comitar o trabalho existente** — desbloqueia revisão de Git e
-   refatoração segura.
-2. **Decidir o destino de `WalletRepository.create`** (remover ou tornar
+1. **Decidir o destino de `WalletRepository.create`** (remover ou tornar
    transacional).
-3. **Casos de uso LOSS, REFUND e ROLLBACK** — BET (Fase 10) e WIN (Fase 12,
-   com resolução de referência) já estão aplicados e testados; o domínio
-   dos demais kinds está pronto, e a igualdade de valor (regra 5) e a
-   unicidade da reversão (regra 4) continuam sendo responsabilidade do caso
-   de uso/banco.
-4. **Worker de outbox + publisher SQS** — as `PENDING_REFERENCE` já são
-   resolvidas pelo worker de §7.1 (Fase 13); falta validar publicação após
-   commit e publicar os quatro eventos exigidos. Nenhuma pendência de schema
-   restou dessa frente (colunas de tentativas e índices migrados na Fase 13).
-5. **Camada HTTP** compartilhando os casos de uso.
-6. **Testes com ≥3 processos/instâncias simultâneos** e com reinício do
-   serviço — é o que ainda falta para encerrar a frente de concorrência e
-   idempotência.
-7. **Inbox, retries, backoff e DLQ.**
-8. **Observabilidade e reconciliação.**
+2. **Testes com ≥3 processos/instâncias simultâneos** e com **reinício do
+   serviço** — encerra a frente de concorrência e idempotência.
+3. **Observabilidade (§12)** — logs JSON com IDs de correlação e métricas.
+4. **Consumidor da fila de eventos** da outbox (§11, passo 5).
+5. **Corrigir `bun run test:e2e`** (configuração do scaffold NestJS).

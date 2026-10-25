@@ -17,17 +17,18 @@ por requisito eliminatório está em `ACCEPTANCE_CHECKLIST.md`.
 - [x] Integrar o scaffold à raiz e remover a pasta temporária.
 - [x] Registrar a fundação em commit.
 
-> A partir daqui, **nada está commitado**: todo o código de `src/domain/`,
-> `src/application/`, `src/infrastructure/`, `src/migrations/`, `test/` e os
-> arquivos de infraestrutura são alterações locais não versionadas. Ver
-> `PROGRESS.md`.
+> O histórico de versionamento está organizado em commits desde a entrega
+> final (ver `PROGRESS.md`, seção "Situação do versionamento").
 
 ## Dia 1 — Infraestrutura e domínio financeiro
 - [x] Criar Docker Compose para PostgreSQL e LocalStack.
       (`compose.yaml`; containers verificados em execução.)
 - [~] Configurar MikroORM e migrations versionadas e reversíveis.
-      MikroORM configurado e migration aplicada em banco real. **A
-      reversibilidade (`down`) nunca foi executada nem verificada.**
+      MikroORM configurado e migrations aplicadas em banco real (hoje são
+      quatro). `up` **e** `down` executados no banco de integração para
+      `PendingReferenceRetry`, `ReversalUniqueProcessed` e
+      `ReversalUniquePerReference`; a `down` da `InitialSchema` nunca foi
+      executada.
 - [x] Definir constraints e índices para as invariantes financeiras.
       (`Migration20261024021931_InitialSchema.ts`; duas delas verificadas por
       teste real: `wallets_balance_non_negative` e
@@ -43,17 +44,18 @@ por requisito eliminatório está em `ACCEPTANCE_CHECKLIST.md`.
       `matchesPayload`, `ledgerDirectionFor`).
 - [x] Implementar abertura interna da carteira com OPENING e ledger atômicos.
       (`OpenWalletUseCase`; atomicidade verificada contra PostgreSQL real.)
-- [~] Implementar BET, WIN, LOSS, REFUND e ROLLBACK conforme as regras oficiais.
+- [x] Implementar BET, WIN, LOSS, REFUND e ROLLBACK conforme as regras oficiais.
       **Domínio completo** das cinco operações (factories com validação de
       campos, referências, valores e `FailureCode`, com testes de casos
-      válidos, inválidos, limites e transições). Como **casos de uso**
-      existem **a BET** (`ProcessBetUseCase`) e a **WIN**
-      (`ProcessWinUseCase`, com os três desfechos de referência: crédito,
-      `PENDING_REFERENCE` + evento e `REFERENCE_MISMATCH`), ambos
-      integrados ao domínio com validação antes do banco,
-      `roundId`/`gameId` obrigatórios (`INVALID_ROUNDID`/`INVALID_GAMEID`)
-      e eventos na outbox. LOSS, REFUND e ROLLBACK ainda não têm caso de uso
-      nem HTTP.
+      válidos, inválidos, limites e transições). Os **cinco casos de uso**
+      existem (`ProcessBetUseCase`, `ProcessWinUseCase`, `ProcessLossUseCase`
+      e `ProcessReversalUseCase` para `REFUND`/`ROLLBACK`), integrados ao
+      domínio com validação antes do banco, `roundId`/`gameId` obrigatórios
+      (`INVALID_ROUNDID`/`INVALID_GAMEID`), eventos na outbox e as regras do
+      §7 aplicadas nas reversões (referência precisa estar `PROCESSED`,
+      `REFUND` só reverte `BET`, igualdade de valor e no máximo **uma**
+      reversão processada por referência — a disputa vira `REJECTED` de
+      auditoria).
 - [x] Garantir saldo, transação, ledger e outbox na mesma transação SQL.
       Vale para OPENING, BET e WIN, todos verificados em **PostgreSQL real**
       (cenários de concorrência, invariante saldo ⇄ ledger e **rollback
@@ -70,7 +72,7 @@ flutuante ✓; saldo e ledger consistentes ✓ (OPENING em banco real); migratio
 podem ser aplicadas ✓ e **revertidas — não verificado**.
 
 ## Dia 2 — API, idempotência, concorrência e mensageria
-- [ ] Implementar os contratos HTTP definidos no README oficial:
+- [x] Implementar os contratos HTTP definidos no README oficial:
   - POST /wallets
   - GET /wallets/:walletId
   - GET /wallets/:walletId/ledger
@@ -78,10 +80,16 @@ podem ser aplicadas ✓ e **revertidas — não verificado**.
   - POST /wagering/transactions
   - GET /wagering/transactions/:transactionId
   - GET /providers/:providerId/wagering/transactions/:externalTransactionId
-- [ ] Validar payloads, códigos HTTP e códigos de falha de negócio.
+
+  (mais `GET /health/live` e `GET /health/ready`; controllers sem regra
+  financeira, reutilizando os casos de uso — `src/http/`, 16 testes de
+  integração.)
+- [x] Validar payloads, códigos HTTP e códigos de falha de negócio.
       A taxonomia `FailureCode` (README §7.2) está definida e documentada em
-      `src/domain/wagering/failure-code.ts`; o **mapeamento HTTP** continua
-      pendente, pois não há camada HTTP.
+      `src/domain/wagering/failure-code.ts`; o **mapeamento HTTP** está
+      fechado em `src/http` (400 payload inválido, 404, 409 conflito de
+      idempotência/reversão, 422 rejeição de regra, 202 aceite pendente, 503
+      transitória) — um único mapeamento para todos os endpoints (§9).
 - [x] Implementar idempotência persistida com hash canônico do payload.
       Componente compartilhado `src/application/wagering/payload-hash.ts`:
       SHA-256 sobre JSON canônico com **chaves ordenadas** e **`kind`
@@ -99,32 +107,52 @@ podem ser aplicadas ✓ e **revertidas — não verificado**.
       `WalletRepository.findByIdForUpdate`, usado pelo `ProcessBetUseCase`;
       unique `wallets_player_currency_unique` validada sob corrida real de
       abertura. Verificado com 2, 5 e 50 apostas concorrentes na mesma wallet.
-      **Múltiplas instâncias (processos) ainda não testadas.**
-- [ ] Implementar inbox persistente e deduplicação de mensagens.
-      Existe apenas a entidade e a tabela.
-- [~] Implementar outbox transacional e publishers concorrentes.
-      Gravação atômica implementada nos dois casos de uso. **Não há publisher
-      nem worker.**
+      **Entre processos independentes** verificado depois (2 processos;
+      faltam ≥3 simultâneos e reinício).
+- [x] Implementar inbox persistente e deduplicação de mensagens.
+      `InboxMessage` (§6.5) + `InboxMessageRepository`, unique
+      `(consumer_name, message_id)` no banco; duplicatas e redelivery não
+      geram efeito novo.
+- [x] Implementar outbox transacional e publishers concorrentes.
+      Gravação atômica nos casos de uso + `OutboxPublisherWorker` com claim
+      `FOR UPDATE SKIP LOCKED`, janela gravada antes de publicar, retentativas
+      limitadas com backoff e desligamento gracioso — dois publishers
+      concorrentes testados sem perder nem duplicar indefinidamente.
 - [x] Provisionar filas SQS, DLQ e políticas de redrive no ambiente local.
       (`docker/localstack/init-queues.sh` em dev; fila de integração criada
       pela própria suíte. Existência verificada no LocalStack real.)
-- [ ] Implementar o consumidor SQS reutilizando os casos de uso HTTP.
-- [ ] Garantir ACK somente após commit durável.
-- [ ] Implementar retries com backoff e recuperação de referências pendentes.
-- [~] Publicar os eventos exigidos:
-  - WagerTransactionProcessed — gravado na outbox, **não publicado**
-  - WagerTransactionRejected — gravado na outbox, **não publicado**
-  - WalletBalanceChanged — gravado na outbox, **não publicado**
-  - WagerTransactionPendingReference — **não existe**
+- [x] Implementar o consumidor SQS reutilizando os casos de uso HTTP.
+      `WagerCommandConsumerWorker` + `ReceiveWagerTransactionUseCase`
+      despacham para os mesmos casos de uso da entrada HTTP (§10).
+- [x] Garantir ACK somente após commit durável.
+      `DeleteMessage` só depois do commit; queda entre commit e ack é
+      recuperada por outra instância (inclusive em processo distinto) sem
+      duplicar efeitos.
+- [x] Implementar retries com backoff e recuperação de referências pendentes.
+      Backoff `5 s × 2^(n−1)` (teto 15 min), 10 tentativas e TTL de 6 h
+      (§7.1); reentrega por visibilidade para transitórios e DLQ para
+      permanentes (`maxReceiveCount`).
+- [x] Publicar os eventos exigidos:
+  - WagerTransactionProcessed — publicado
+  - WagerTransactionRejected — publicado
+  - WalletBalanceChanged — publicado
+  - WagerTransactionPendingReference — publicado
+
+  (os quatro `eventType` são conferidos na mensagem recebida do SQS em
+  `outbox-publisher.integration.e2e-spec.ts`.)
 
 **Aceite da fase:** 50 requisições paralelas idênticas geram um único efeito
 financeiro — **verificado em PostgreSQL real**; duas apostas de 80,00 contra
 saldo 100,00 resultam em uma aprovação e saldo 20,00 — **verificado em
-PostgreSQL real**; eventos só são publicados após commit — **não publicados**
-(não existe publisher).
+PostgreSQL real**; eventos só são publicados após commit — **verificado**
+(teste de rollback comprova que a transação desfeita não gera publicação).
 
 ## Dia 3 — Resiliência, testes e entrega
-- [ ] Executar a aplicação em pelo menos três instâncias/processos.
+- [~] Executar a aplicação em pelo menos três instâncias/processos.
+      Dois processos independentes (`bun`, conexões próprias, largada
+      simultânea) já concorrem sobre o mesmo banco
+      (`test/integration/multi-process.integration.e2e-spec.ts`); **≥3
+      processos simultâneos e reinício do serviço** continuam pendentes.
 - [x] Testar concorrência na mesma carteira e paralelismo entre carteiras distintas.
       (`concurrency.integration.e2e-spec.ts`: 2 e 5 apostas de 80,00 sobre
       100,00, 50 envios idênticos e apostas em carteiras distintas em paralelo,
@@ -132,30 +160,48 @@ PostgreSQL real**; eventos só são publicados após commit — **não publicado
 - [~] Testar duplicação, conflito de idempotência e reinícios.
       Duplicação (50×) e conflito (mesma wallet e entre wallets distintas)
       verificados em PostgreSQL real. **Reinício do processo não testado.**
-- [ ] Testar falha após commit e antes do ACK SQS.
-- [ ] Testar recuperação da outbox e publishers concorrentes.
-- [ ] Testar redelivery, retries, backoff, DLQ e encerramento SIGTERM.
-- [ ] Testar referências recebidas fora de ordem e limite de tentativas.
+- [x] Testar falha após commit e antes do ACK SQS.
+      (`wager-command-consumer.integration` e, entre processos, o cenário de
+      redelivery de `multi-process.integration.e2e-spec.ts`.)
+- [x] Testar recuperação da outbox e publishers concorrentes.
+      (`outbox-publisher.integration.e2e-spec.ts`: queda antes/depois do
+      commit, dois publishers concorrentes, retentativa e os quatro eventos.)
+- [~] Testar redelivery, retries, backoff, DLQ e encerramento SIGTERM.
+      Redelivery, retries, backoff e DLQ testados em PostgreSQL + LocalStack
+      reais (inclusive redelivery entre processos); o desligamento gracioso
+      está implementado (shutdown hooks + ciclo em andamento aguardado), mas
+      **SIGTERM em si não é testado**.
+- [x] Testar referências recebidas fora de ordem e limite de tentativas.
+      (`pending-reference.integration.e2e-spec.ts`: 10 cenários, incluindo
+      referência tardia, esgotamento das 10 tentativas e TTL.)
 - [~] Validar constraints, migrations e ledger append-only.
       Duas constraints, o rollback e o trigger `wallet_ledger_immutable`
-      (UPDATE e DELETE rejeitados) verificados em banco real. **Reversão de
-      migration (`down`) não verificada.**
-- [ ] Implementar reconciliação entre saldo persistido e ledger.
-      (`isBalanced()` existe no domínio; não há endpoint nem caso de uso.)
-- [ ] Implementar logs JSON, métricas e liveness/readiness.
+      (UPDATE e DELETE rejeitados) verificados em banco real. `up` **e** `down`
+      conferidos para `PendingReferenceRetry` e as duas migrations de reversão;
+      **`down` da migration inicial não executada**.
+- [x] Implementar reconciliação entre saldo persistido e ledger.
+      (`ReconcileWalletUseCase` + `POST /wallets/:walletId/reconciliation`;
+      acusa divergência sem alterar dados, testado com saldo corrompido.)
+- [~] Implementar logs JSON, métricas e liveness/readiness.
+      **Liveness e readiness prontos** (`/health/live`, `/health/ready`);
+      logs JSON estruturados e métricas operacionais (§12) continuam
+      pendentes.
 - [x] Documentar arquitetura, trade-offs, variáveis e comandos reproduzíveis.
       (`README.md`, `ARCHITECTURE.md`, `PROGRESS.md`, `.env.example`,
       `.env.integration.example`.)
-- [~] Executar testes unitários e de integração com PostgreSQL e SQS reais em containers.
-      Harness pronto e suíte passando, agora incluindo concorrência real em
-      PostgreSQL. **Ainda faltam concorrência entre instâncias (processos),
-      publicação real e redelivery.**
-- [ ] Revisar Git e confirmar que não há segredos versionados.
-      Bloqueado: nada foi commitado e não há commits desde a fundação.
+- [x] Executar testes unitários e de integração com PostgreSQL e SQS reais em containers.
+      Harness pronto e suíte passando (258 unitários + 92 de integração),
+      incluindo concorrência real em PostgreSQL, publicação/consumo com SQS
+      real e concorrência entre **processos independentes**.
+- [x] Revisar Git e confirmar que não há segredos versionados.
+      Histórico organizado em commits com arquivos explicitamente
+      selecionados; nenhum segredo, credencial real ou artefato temporário
+      versionado.
 
 **Aceite da fase:** invariantes financeiras preservadas sob concorrência e
-duplicação — **demonstrado em PostgreSQL real**; sob falhas e reinícios —
-**não demonstrado**; testes reproduzíveis — parcial; documentação completa —
+duplicação — **demonstrado em PostgreSQL real**; sob falhas e redelivery
+(inclusive entre processos) — **demonstrado**; sob reinício do serviço —
+**não demonstrado**; testes reproduzíveis — sim; documentação completa —
 nesta etapa.
 
 ## Infraestrutura de testes de integração (disponível)
@@ -177,12 +223,13 @@ nesta etapa.
       outbox verificados por SQL cru após cada cenário.
 
 Ainda pendente nesta frente:
-- [ ] Concorrência entre múltiplas INSTÂNCIAS (processos) contra o mesmo banco —
-      os testes existentes concorrem com `EntityManager` e conexões distintas
-      de um único processo.
-- [ ] Publisher SQS de produção e worker de outbox (publicação após commit).
-- [ ] Reversão de migrations (`down`) verificada em banco real.
-- [ ] Redelivery, retries, backoff e DLQ.
+- [~] Concorrência entre múltiplas INSTÂNCIAS (processos) contra o mesmo banco —
+      **2 processos independentes** já concorrem
+      (`test/integration/multi-process.integration.e2e-spec.ts`); faltam
+      **≥3 processos simultâneos** e **reinício do serviço**.
+- [~] Reversão de migrations (`down`) verificada em banco real — `up`/`down`
+      conferidos em três das quatro migrations; falta a `down` da
+      `Migration20261024021931_InitialSchema`.
 - [ ] Corrigir `bun run test:e2e` (scaffold NestJS carrega enums em
       strip-only mode do Node 24 e falha; causa e correção conhecidas, registradas
       em `PROGRESS.md`).
@@ -230,33 +277,26 @@ política de referência do `WIN`").
 
 ## Próxima sequência recomendada
 
-**Estado atual:** concluídos os itens **3** (LOSS/REFUND/ROLLBACK), **4**
-(worker de outbox + publisher), **5** (camada HTTP), **7** (Inbox, retries,
-backoff e DLQ do consumidor) e a **reconciliação** de 8. Seguem pendentes: **1**
-(commit do trabalho existente), **2** (`WalletRepository.create`), **6**
-(testes com ≥3 processos/instâncias e reinício) e a **observabilidade** (§12).
-Ordem por dependência — cada etapa destrava a seguinte:
+**Estado atual:** concluídos os itens **1** (histórico de commits), **3**
+(LOSS/REFUND/ROLLBACK), **4** (worker de outbox + publisher), **5** (camada
+HTTP), **7** (Inbox, retries, backoff e DLQ do consumidor) e a
+**reconciliação** de 8, além de os testes entre **processos independentes**
+terem entrado na frente de **6**. Seguem pendentes: **2**
+(`WalletRepository.create`), o restante de **6** (≥3 processos simultâneos e
+reinício do serviço) e a **observabilidade** (§12). Ordem por dependência —
+cada etapa destrava a seguinte:
 
-1. **Comitar o trabalho existente.** Bloqueia revisão de Git, histórico
-   confiável e qualquer refatoração segura.
-2. **Decidir o destino de `WalletRepository.create`** (remover ou tornar
+1. **Decidir o destino de `WalletRepository.create`** (remover ou tornar
    transacional). É um caminho inseguro que pode ser chamado por engano.
-3. **Casos de uso LOSS, REFUND e ROLLBACK** — BET (etapa anterior) e WIN
-   (`ProcessWinUseCase`, com resolução de referência, ledger e eventos)
-   já são o modelo de caso de uso integrado ao domínio; resta aplicar os
-   três kinds de reversão/resultado.
-4. **Worker de outbox + publisher SQS** — as `PENDING_REFERENCE` já são
-   resolvidas pelo worker de §7.1 (Fase 13: backoff exponencial, 10
-   tentativas, TTL de 6 h, claim com `FOR UPDATE SKIP LOCKED` e rejeição
-   atômica em `REFERENCE_NOT_FOUND`; as pendências de schema foram
-   apresentadas e migradas). Resta desta frente: validar publicação após
-   commit e publicar os quatro eventos exigidos.
-5. **Camada HTTP** compartilhando os casos de uso.
-6. **Testes com três ou mais processos/instâncias simultâneos** e com
-   reinício do serviço — é o que ainda falta para encerrar a frente de
-   concorrência (a concorrência entre transações/conexões já está testada).
-7. **Inbox, retries, backoff e DLQ.**
-8. **Observabilidade e reconciliação.**
+2. **Testes com ≥3 processos/instâncias simultâneos** e com **reinício do
+   serviço** — encerra a frente de concorrência e idempotência (os testes com
+   2 processos independentes já cobrem §8, corrida de reversão e redelivery
+   após commit).
+3. **Observabilidade (§12)** — logs JSON estruturados com IDs de correlação e
+   métricas operacionais.
+4. **Consumidor da fila de eventos** da outbox (§11, passo 5) — quem torna a
+   duplicata de publicação segura do lado dos eventos.
+5. **Corrigir `bun run test:e2e`** (configuração do scaffold NestJS).
 
 ## Prioridades de avaliação
 1. Correção financeira — 20 pontos.

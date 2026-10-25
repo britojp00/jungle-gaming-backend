@@ -376,11 +376,10 @@ da carteira (`findByIdForUpdate`), idempotência persistida e outbox atômica:
 > reutiliza **exatamente** o mesmo caminho — comportamento da BET idêntico
 > ao anterior, coberto pela própria suíte.
 
-> **Limite:** LOSS, REFUND e ROLLBACK ainda **não** têm caso de uso — o
-> domínio deles (factories e transições) está pronto e testado, mas nenhum
-> caso de uso os processa. Ter enum, constraint e factory prontos **não** é
-> o mesmo que fluxo concluído. A WIN passou a ter caso de uso nesta fase
-> (ver abaixo).
+> **Limite da época:** LOSS, REFUND e ROLLBACK não tinham caso de uso nesta
+> fase — o domínio deles (factories e transições) já estava pronto e testado.
+> Desde então entraram `ProcessLossUseCase` e `ProcessReversalUseCase`
+> (ver "Regras de reversão (§7)" abaixo).
 
 ### `ProcessWinUseCase` (`src/application/wagering/use-cases/process-win.use-case.ts`)
 Processa **WIN** implementando a política de referência registrada na seção
@@ -607,8 +606,9 @@ regra 8): segue `PENDING_REFERENCE` e termina pela §7.1 com
 releitura feita **depois** do lock enxerga o commit do par (READ COMMITTED)
 e a unique `(wallet_id, transaction_id)` do ledger derruba a transação
 inteira se mesmo assim houver duas. Saldo, ledger, transação e outbox
-seguem na mesma transação; nada é publicado antes do commit (a outbox só é
-gravada aqui — ainda não há publisher).
+seguem na mesma transação; nada é publicado antes do commit (a outbox é
+gravada aqui e só sai para o SQS depois do commit, pelo
+`OutboxPublisherWorker`).
 
 #### Worker (`src/infrastructure/workers/pending-reference.worker.ts`)
 
@@ -681,7 +681,7 @@ mesmo tempo**; um reenvio do mesmo evento (queda entre publicar e marcar)
 muito próximos, mas é **otimização** — o README (§8) é explícito em que
 recursos do broker não são a garantia final. Tornar uma duplicata segura é
 tarefa do **consumidor**, via Inbox persistente por `(consumerName,
-messageId)` (§10), que ainda não existe.
+messageId)` (§10) — implementado no consumidor de comandos (ver abaixo).
 
 **Shutdown** (§10/§14): `main.ts` habilita `app.enableShutdownHooks()`, então
 em SIGTERM/SIGINT o NestJS chama `onModuleDestroy` do worker — que para o
@@ -709,7 +709,7 @@ alteração.
 |---|---|---|
 | identidade da mensagem | `messageId` do envelope + `consumerName` lógico (`wager-transactions`) | §10/§6.5 deduplicam por `(consumerName, messageId)`; o nome tem de ser igual em todas as instâncias |
 | `referenceExternalTransactionId` | aceito como opcional em `data` | o exemplo da §10 omite o campo, mas §7 (regras 1 e 2) exige quando o kind referencia |
-| `kind` sem caso de uso | `LOSS`/`REFUND`/`ROLLBACK` → erro permanente → DLQ | não implementados nesta etapa; repetir nunca os torna processáveis |
+| `kind` | despacho para os **mesmos casos de uso da entrada HTTP** — `BET` → `ProcessBetUseCase`, `LOSS` → `ProcessLossUseCase`, `REFUND`/`ROLLBACK` → `ProcessReversalUseCase`, `WIN` → `ProcessWinUseCase` | §10: "reutilizar o mesmo use case da entrada HTTP" |
 | negócio | o caso de uso **retorna** (inclusive `REJECTED`) → ack | §10: "erros de negócio (terminal, ack)" |
 | permanente | envelope inválido e `IDEMPOTENCY_PAYLOAD_CONFLICT` → DLQ e, **só então**, ack | §10: "permanentes (DLQ)"; §9: conflito, não replay |
 | transitório | todo o resto → **sem ack** | §10: "transitórios (retry com backoff)"; a visibilidade do SQS reentrega e o `maxReceiveCount` leva à DLQ |
@@ -718,6 +718,37 @@ alteração.
 
 Não se alega entrega exactly-once: a garantia é da Inbox persistente, da
 unique de idempotência e da atomicidade da transação.
+
+### Regras de reversão (§7) — `ProcessReversalUseCase`
+
+`REFUND` e `ROLLBACK` compartilham um caso de uso, com o julgamento
+centralizado em `evaluateReversal`
+(`src/application/wagering/process-support.ts`) — **o mesmo** aplicado pelo
+worker de §7.1 quando a reversão nasce pendente e é resolvida depois:
+
+- **regra 1**: a referência externa é obrigatória (a factory recusa sem ela);
+- **regra 3**: a referência precisa estar `PROCESSED` e ser do tipo que a
+  operação pode reverter — `REFUND` só reverte `BET`; `ROLLBACK` reverte
+  `BET`, `WIN` ou `REFUND`. Referência rejeitada, pendente ou falha nunca
+  moveu dinheiro e não é alvo elegível (`REFERENCE_MISMATCH`);
+- **regra 5**: o valor é **igual** ao da referência
+  (`REFERENCE_AMOUNT_MISMATCH`);
+- **regra 4 ampliada**: cada referência recebe no máximo **uma** reversão
+  processada, **independentemente do tipo** — `REFUND` e `ROLLBACK` da mesma
+  referência não se somam. Continua permitido reverter um `REFUND` com
+  `ROLLBACK`: aí a referência é o próprio `REFUND` (outra chave).
+
+| Garantia | Mecanismo |
+|---|---|
+| nunca duas reversões processadas do mesmo alvo | índice parcial `wager_transactions_reversal_unique` **e** `Migration20261025160000_ReversalUniquePerReference` (`(provider_id, reference_external_transaction_id)` sobre `kind IN ('REFUND','ROLLBACK') AND status = 'PROCESSED'`) |
+| o perdedor da corrida não se perde em silêncio | a transação financeira inteira é desfeita e a tentativa vira linha `REJECTED` com `REFERENCE_ALREADY_REVERSED`, em transação própria, mais evento de rejeição (auditoria); resposta HTTP **409**, na primeira chamada e no replay |
+| auditoria que falha não vira sucesso | se a linha de auditoria não puder ser gravada (banco indisponível, ou outra tentativa idêntica já a gravou), o conflito continua reportado como erro e a falha vai para o log estruturado — nunca se afirma que a auditoria persistiu quando não persistiu |
+
+Trade-off registrado: o alvo precisa estar `PROCESSED` porque referência
+rejeitada/pendente nunca moveu dinheiro — permitir reverter essas linhas
+criaria lançamento sem efeito correspondente. Testes em
+`reversal.integration.e2e-spec.ts` e, entre processos, em
+`multi-process.integration.e2e-spec.ts` (corrida `REFUND` × `ROLLBACK`).
 
 ### Hash de idempotência (`src/application/wagering/payload-hash.ts`)
 Algoritmo exigido pelo README §9 ("payloadHash = hash de um JSON canônico
@@ -785,8 +816,9 @@ modelam apenas a orquestração.
 - Banco exclusivo `wagering_integration`; `DATABASE_URL` de desenvolvimento
   nunca é lida.
 - Migrations rodam somente no banco de integração, usando os arquivos já
-  versionados. Hoje são duas (`InitialSchema` e `PendingReferenceRetry`);
-  a da Fase 13 teve `up` **e** `down` executados à mão no banco de
+  versionados. Hoje são quatro (`InitialSchema`, `PendingReferenceRetry`,
+  `ReversalUniqueProcessed` e `ReversalUniquePerReference`); as três
+  últimas tiveram `up` **e** `down` executados à mão no banco de
   integração, com conferência de índices/colunas nas duas direções.
 - O LocalStack de integração não usa o `init-queues.sh` de dev: a própria
   suíte cria e confere a sua fila.
@@ -850,22 +882,22 @@ transporte real em vez de um paralelo (§13).
 
 # 2. Planejado (não implementado)
 
-Os módulos abaixo são **planejados**. Nenhum deles tem implementação hoje.
+Restam deste escopo:
 
-- `wallets`: leitura de saldo e ledger por HTTP ainda não existe.
-- `wagering`: casos de uso de LOSS, REFUND e ROLLBACK (o **domínio** dessas
-  operações já existe e está testado — factories e transições em
-  `wager-transaction.ts`; BET e WIN já têm caso de uso).
-- `idempotência`: o hash canônico é um componente compartilhado e testado
-  (`payload-hash.ts`); BET e WIN o utilizam — replay/conflito estão
-  centralizados em `process-support.ts`.
-- `messaging`: **inbox implementada** (`InboxMessage` de domínio +
-  `InboxMessageRepository`) e **consumidor da fila de comandos** no ar
-  (`WagerCommandConsumerWorker` — ver "Consumidor de comandos (§10)"); a
-  outbox tem publisher. Falta o consumidor dos **eventos** da outbox e a
-  observabilidade.
-- `health`: liveness e readiness não existem.
-- Nenhum endpoint HTTP está registrado em `AppModule` (só `MikroOrmModule`).
+- `messaging`: o consumidor dos **eventos** da outbox (§11, passo 5) — quem
+  torna a duplicata de publicação segura do lado dos eventos;
+- `observabilidade` (§12): logs JSON estruturados com IDs de correlação e
+  métricas operacionais;
+- `bun run test:e2e` do scaffold (falha por configuração conhecida,
+  registrada em `PROGRESS.md`);
+- decisão sobre `WalletRepository.create` (remover ou tornar transacional).
+
+Tudo o mais está implementado: os cinco casos de uso de wagering
+(`ProcessBet`, `ProcessWin`, `ProcessLoss`, `ProcessReversal`,
+`ResolvePendingReferences`), a camada HTTP completa (seção seguinte), a
+`idempotência` (`payload-hash.ts`, com replay/conflito centralizados em
+`process-support.ts`), o `messaging` (Inbox, consumidor de comandos,
+publisher da outbox) e o `health` (`/health/live`, `/health/ready`).
 
 ### Contratos HTTP do README oficial — implementados (§9)
 `POST /wallets`, `GET /wallets/:walletId`, `GET /wallets/:walletId/ledger`
@@ -891,9 +923,12 @@ persistido verificado por SQL após cada cenário. Duas **instâncias do
 worker de §7.1** drenando o mesmo lote também estão cobertas
 (`pending-reference.integration.e2e-spec.ts`): `EntityManager` e conexões
 distintas, `SKIP LOCKED` + lock da wallet + releitura pós-lock, com um único
-crédito por linha. **O que ainda não existe:** execução com **três ou mais
-processos/instâncias** simultâneos (OS distintas) — os testes concorrem com
-`EntityManager` e conexões distintas dentro de um processo.
+crédito por linha. **Entre processos independentes** há teste próprio
+(`multi-process.integration.e2e-spec.ts`): dois processos `bun`, conexões
+próprias e largada simultânea — cenário do §8, corrida `REFUND` × `ROLLBACK`
+e redelivery após commit sem duplicar efeitos. **O que ainda não existe:**
+execução com **três ou mais processos/instâncias** simultâneos e **reinício
+do serviço**.
 
 ### Mensageria
 A entrega é at-least-once com deduplicação; não se promete exactly-once entre
@@ -923,10 +958,14 @@ locks e atraso da outbox.
 
 ### Testes ainda não cobertos
 Execução com **≥3 processos** de verdade (a concorrência do consumidor usa 3
-instâncias em um processo) e a reversão (`down`) da migration inicial em banco
-real (a `down` de `Migration20261024150000_PendingReferenceRetry` já foi
-executada e conferida na Fase 13). Publicação (queda antes/depois do commit,
-dois publishers, retentativa) coberta em `outbox-publisher.integration.e2e-spec.ts`;
-consumo (reentrega sem duplicar, atomicidade, queda entre commit e ack,
-transitório até a DLQ, permanente à DLQ, concorrência entre instâncias) em
-`wager-command-consumer.integration.e2e-spec.ts`.
+instâncias em um processo; entre processos, o teste próprio cobre **2**) e
+**reinício do serviço**; além da reversão (`down`) da migration inicial em
+banco real (a `down` de `PendingReferenceRetry` e das duas migrations de
+reversão já foi executada e conferida). Publicação (queda antes/depois do
+commit, dois publishers, retentativa) coberta em
+`outbox-publisher.integration.e2e-spec.ts`; consumo (reentrega sem duplicar,
+atomicidade, queda entre commit e ack, transitório até a DLQ, permanente à
+DLQ, concorrência entre instâncias) em
+`wager-command-consumer.integration.e2e-spec.ts`; concorrência, corrida de
+reversão e redelivery **entre processos independentes** em
+`multi-process.integration.e2e-spec.ts`.

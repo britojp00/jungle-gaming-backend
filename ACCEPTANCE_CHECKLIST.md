@@ -8,12 +8,17 @@ Legenda de estado:
 - **Pendente** — sem implementação ou sem qualquer evidência.
 
 > Regra adotada: nenhum item dependente de **execução em múltiplas
-> instâncias/processos** está marcado como concluído. A **concorrência real**
-> tem teste em PostgreSQL real (`concurrency.integration.e2e-spec.ts`), a
-> **publicação de eventos** está implementada e testada
-> (`outbox-publisher.integration`, `wager-command-consumer.integration`) e a
-> **API HTTP** também (`http.integration.e2e-spec.ts`); a frente de
-> **múltiplos processos** continua aberta.
+> instâncias/processos** está marcado como concluído sem evidência nessa
+> escala. A **concorrência real** tem teste em PostgreSQL real
+> (`concurrency.integration.e2e-spec.ts`), a **publicação de eventos** está
+> implementada e testada (`outbox-publisher.integration`,
+> `wager-command-consumer.integration`), a **API HTTP** também
+> (`http.integration.e2e-spec.ts`) e a **concorrência entre processos
+> independentes** tem teste próprio desde a entrega final
+> (`multi-process.integration.e2e-spec.ts`: cenário §8 e corrida de reversão
+> entre dois processos, mais redelivery após commit em processo distinto).
+> Continuam abertos: execução com **≥3 processos simultâneos** e **reinício
+> do serviço**.
 
 ---
 
@@ -46,7 +51,8 @@ Falha eliminatória se `number`/`float`/`double` representar dinheiro.
   cru: nunca negativo, reconciliado com o ledger e `version` coerente.
 - **Escopo honesto:** as requisições concorrentes usam `EntityManager` e
   conexões distintas dentro de um processo. A exigência de **múltiplas
-  instâncias** é coberta pelo risco 5, que continua pendente.
+  instâncias** tem evidência com **2 processos independentes** no risco 5
+  (restam ≥3 processos simultâneos e reinício).
 
 ### 3. Débito ou crédito duplicado — **Parcial**
 - **Implementado:** `ProcessBetUseCase` e `ProcessWinUseCase` fazem replay
@@ -64,8 +70,11 @@ Falha eliminatória se `number`/`float`/`double` representar dinheiro.
   (`ProcessLossUseCase`, `ProcessReversalUseCase`) com as regras 3, 4, 5 e 9
   verificadas em PostgreSQL real (`test/integration/reversal.integration.e2e-spec.ts`);
   a unicidade da reversão continua no schema
-  (`wager_transactions_reversal_unique`). **Falta comprovar:** a deduplicação
-  dessas reversões sob concorrência entre processos (ver risco 5).
+  (`wager_transactions_reversal_unique`) e foi reforçada pela
+  `Migration20261025160000_ReversalUniquePerReference`. **Comprovado também
+  entre processos independentes:** a corrida `REFUND` × `ROLLBACK` sobre a
+  mesma referência produz uma `PROCESSED` e uma `REJECTED` +
+  `REFERENCE_ALREADY_REVERSED` (`multi-process.integration.e2e-spec.ts`).
 
 ### 4. Idempotência apenas em memória — **Parcial**
 - **Evidência de persistência:** `payload_hash` e `idempotency_key` são colunas
@@ -80,10 +89,15 @@ Falha eliminatória se `number`/`float`/`double` representar dinheiro.
 - **Falta demonstrar:** a garantia sob **reinício** do processo não foi
   testada (a persistência em banco existe, mas não há teste de reinício).
 
-### 5. Solução correta somente com uma instância — **Pendente**
-- **Falta demonstrar:** não há execução com três instâncias nem qualquer teste
-  de concorrência entre processos. O lock é de banco (correto por
-  construção), mas **não verificado**.
+### 5. Solução correta somente com uma instância — **Parcial**
+- **Comprovado agora:** execução com **dois processos independentes**
+  (`bun`, conexões próprias, largada simultânea) sobre o mesmo banco
+  (`test/integration/multi-process.integration.e2e-spec.ts`): o cenário do
+  §8 (duas apostas de `80.00` sobre `100.00` → uma `PROCESSED`, uma
+  `REJECTED`, saldo `20.00`, **um** débito), a corrida `REFUND` × `ROLLBACK`
+  sobre a mesma referência e o redelivery após commit sem duplicar efeitos.
+- **Falta demonstrar:** execução com **≥3 processos/instâncias simultâneos**
+  e **reinício do serviço**.
 
 ### 6. Publicação de evento antes do commit — **Concluído**
 - **Implementado:** `OpenWalletUseCase`, `ProcessBetUseCase` e
@@ -98,7 +112,7 @@ Falha eliminatória se `number`/`float`/`double` representar dinheiro.
   testados em PostgreSQL + LocalStack reais (`outbox-publisher.integration`,
   `wager-command-consumer.integration`).
 
-### 7. Ausência de ledger auditável — **Parcial**
+### 7. Ausência de ledger auditável — **Concluído**
 - **Evidência:** tabela `wallet_ledger_entries` com CHECKs
   (`wallet_ledger_amount_positive`, saldos não negativos,
   `wallet_ledger_balance_consistent`) e proteção contra alteração **no banco**:
@@ -110,8 +124,10 @@ Falha eliminatória se `number`/`float`/`double` representar dinheiro.
   rejeitados com "Wallet ledger entries are immutable"). A reconciliação
   saldo ⇄ ledger é verificada por SQL nos testes de concorrência
   (`wallet.balance == saldo reconstruído pelo ledger`).
-- **Falta demonstrar:** **não há endpoint nem caso de uso** de reconciliação
-  em produção (`isBalanced()` existe apenas no domínio).
+- **Reconciliação em produção:** `ReconcileWalletUseCase` +
+  `POST /wallets/:walletId/reconciliation`, que **acusa** divergência entre o
+  saldo materializado e o ledger sem alterar dados — testado com o saldo
+  corrompido de propósito (`http.integration.e2e-spec.ts`).
 
 ### 8. Testes que substituem completamente PostgreSQL e SQS por mocks — **Concluído**
 - **Evidência:** os fakes (`test/support/fake-entity-manager.ts`) são usados
@@ -121,10 +137,11 @@ Falha eliminatória se `number`/`float`/`double` representar dinheiro.
   rollback (inclusive provocado no fluxo do `ProcessWinUseCase`),
   constraints, atomicidade de `OpenWalletUseCase`/`ProcessWinUseCase` e fila
   SQS.
-- **Limitação honesta:** a cobertura real é **parcial** — inclui concorrência
-  em PostgreSQL real, mas não inclui publicação de eventos nem múltiplas
-  instâncias. O requisito de não depender exclusivamente de mocks está
-  cumprido; a cobertura completa, não.
+- **Limitação honesta:** a cobertura real inclui concorrência em PostgreSQL
+  real, publicação de eventos, consumo de comandos e concorrência entre
+  **processos independentes**; **não** inclui ≥3 processos simultâneos nem
+  reinício do serviço. O requisito de não depender exclusivamente de mocks
+  está cumprido; a cobertura completa, não.
 
 ---
 
@@ -133,21 +150,35 @@ Falha eliminatória se `number`/`float`/`double` representar dinheiro.
 - [x] Valores decimais em strings e moeda explícita. — `MoneyProps`; moeda `^[A-Z]{3}$` obrigatória.
 - [x] Saldo e ledger atualizados atomicamente. — OPENING, BET e WIN verificados em PostgreSQL real, inclusive sob concorrência (2, 5 e 50 apostas) e com **rollback real provocado** no fluxo da WIN (falha após o flush → nada persistido), com saldo, transações, ledger e outbox conferidos por SQL após cada cenário.
 - [x] Ledger append-only. — imutabilidade de domínio + trigger `wallet_ledger_immutable` exercitado por teste (UPDATE/DELETE rejeitados).
-- [~] LOSS não altera saldo. — **domínio**: `affectsBalance()` `false` e
+- [x] LOSS não altera saldo. — `ProcessLossUseCase` aplicado e testado em
+      PostgreSQL real: `registra o resultado sem mover saldo nem ledger`
+      (`reversal.integration.e2e-spec.ts` — o ledger fica só com o
+      OPENING); no domínio, `affectsBalance()` `false` e
       `ledgerDirectionFor()` que lança ("LOSS does not generate ledger
-      entries"), testados; **falta o caso de uso** que prove ausência de
-      débito/crédito e de lançamento no saldo real.
-- [~] REFUND e ROLLBACK não podem ser duplicados. — unicidade garantida no
-      schema pelo índice parcial `wager_transactions_reversal_unique`
-      (regra 4) + factories que exigem referência (regra 1); **sem caso de
-      uso** que os dispare.
-- [ ] Reconciliação entre saldo e ledger. — `isBalanced()` existe; sem endpoint/caso de uso.
+      entries").
+- [x] REFUND e ROLLBACK não podem ser duplicados. — regras 1, 3, 4, 5 e 9 em
+      `ProcessReversalUseCase`/`evaluateReversal` (referência precisa estar
+      `PROCESSED`; `REFUND` só reverte `BET`; valor igual ao da referência;
+      no máximo **uma** reversão processada por referência, seja qual for o
+      tipo), garantidas pelo banco via `wager_transactions_reversal_unique`
+      **e** pela `Migration20261025160000_ReversalUniquePerReference`
+      (`up`/`down` executados no banco de integração). O perdedor da disputa
+      vira linha `REJECTED` de auditoria (`REFERENCE_ALREADY_REVERSED`,
+      HTTP 409); corrida entre processos comprovada em
+      `multi-process.integration.e2e-spec.ts`.
+- [x] Reconciliação entre saldo e ledger. — `ReconcileWalletUseCase` +
+      `POST /wallets/:walletId/reconciliation`; acusa divergência (teste com
+      saldo materializado corrompido) sem alterar dados.
 
 ## Concorrência — 20 pontos
 - [x] Duas apostas de 80 com saldo 100: uma aprovada, outra rejeitada, saldo 20. — `concurrency.integration.e2e-spec.ts` (também com 5 apostas concorrentes).
 - [x] Sem lost updates ou saldo negativo. — risco eliminatório 2; 2, 5 e 50 apostas concorrentes sem saldo negativo nem débito duplicado.
 - [x] Carteiras distintas processam em paralelo. — cenário "Carteiras distintas em paralelo" no mesmo arquivo.
-- [ ] Testes com pelo menos três instâncias. — risco eliminatório 5, ainda não testado (os testes existentes concorrem dentro de um processo).
+- [~] Testes com pelo menos três instâncias. — risco eliminatório 5:
+      **2 processos independentes** já concorrem
+      (`multi-process.integration.e2e-spec.ts` — §8, corrida de reversão e
+      redelivery após commit); **≥3 processos simultâneos** e reinício do
+      serviço continuam sem teste.
 
 ## Idempotência — 15 pontos
 - [x] 50 envios paralelos da mesma aposta geram um débito. — 1 transação, 1 débito, 49 replays; verificado por SQL em PostgreSQL real.
@@ -167,7 +198,11 @@ Falha eliminatória se `number`/`float`/`double` representar dinheiro.
       o publisher só lê linhas já confirmadas e o teste de rollback comprova
       que a transação desfeita não gera publicação.
 - [x] Redelivery não duplica efeitos. — Inbox por `(consumerName, messageId)`;
-      reentrega após queda entre commit e ack não repete débito nem transação.
+      reentrega após queda entre commit e ack não repete débito nem transação —
+      comprovado também **entre processos independentes**
+      (`multi-process.integration.e2e-spec.ts`: o processo que faz o commit
+      sai **sem** ack; outro processo recebe a reentrega, responde `duplicate`
+      e o saldo segue `75.00`).
 - [x] Retries, backoff e DLQ testados. — **outbox**: retentativa limitada (10)
       com backoff `5 s × 2^(n−1)` (teto 15 min); **consumidor**: reentrega por
       visibilidade do SQS para transitórios e DLQ para permanentes, com
@@ -203,13 +238,14 @@ Falha eliminatória se `number`/`float`/`double` representar dinheiro.
 
 ## Arquitetura — 10 pontos
 - [x] Domínio independente de NestJS, SQS e ORM. — `src/domain/` não importa infraestrutura.
-- [~] HTTP e worker compartilham os casos de uso. — **worker sim**: o
-      `PendingReferenceWorker` é apenas agendamento/log e delega tudo ao
-      `ResolvePendingReferencesUseCase`, como o `ProcessWinUseCase` é
-      chamado pela camada que existir. **HTTP não**: nenhum endpoint está
-      registrado.
+- [x] HTTP e worker compartilham os casos de uso. — os controllers de
+      `src/http/` não têm regra financeira e despacham para os mesmos casos
+      de uso que o consumidor SQS (`ReceiveWagerTransactionUseCase` chama os
+      mesmos `ProcessBet`/`ProcessWin`/`ProcessLoss`/`ProcessReversal`); o
+      `PendingReferenceWorker` é só agendamento/log sobre o
+      `ResolvePendingReferencesUseCase`.
 - [x] OPENING não pode ser submetido externamente. — factory `createOpening` exclui estruturalmente metadados de provedor; CHECK `wager_transactions_opening_internal`.
-- [~] Regras de provedor e referência validadas. — **domínio**: factories
+- [x] Regras de provedor e referência validadas. — **domínio**: factories
       validam campos de provedor/idempotência obrigatórios, limites de
       coluna, `roundId`/`gameId`, valor positivo e a política de referência
       por kind (exigida em REFUND/ROLLBACK, opcional em WIN, proibida em
@@ -222,19 +258,21 @@ Falha eliminatória se `number`/`float`/`double` representar dinheiro.
       rodada e wallet, com
       `REJECTED + REFERENCE_MISMATCH` em cada divergência (5 casos
       testados) e `PENDING_REFERENCE` quando o alvo não existe — tudo
-      validado antes de tocar o banco. **Falta**: igualdade de valor
-      (regra 5, das reversões) e mapeamento HTTP.
+      validado antes de tocar o banco. **Regra 5** (igualdade de valor) e as
+      regras 3/4 aplicadas em `evaluateReversal`
+      (`REFERENCE_AMOUNT_MISMATCH`, `REFERENCE_ALREADY_REVERSED`); o
+      **mapeamento HTTP** está fechado em `src/http` (400/404/409/422/202/503).
 
 ## Testes — 10 pontos
-- [x] Testes unitários e de integração. — 248 unitários + 81 de integração (8 PostgreSQL + 8 concorrência + 10 WIN + 10 referência pendente + 7 outbox + 6 consumo de comandos + 4 SQS + 16 HTTP + 12 reversões).
+- [x] Testes unitários e de integração. — 258 unitários + 92 de integração (8 PostgreSQL + 8 concorrência + 10 WIN + 10 referência pendente + 7 outbox + 6 consumo de comandos + 4 SQS + 16 HTTP + 20 reversões + 3 entre processos).
 - [x] PostgreSQL e SQS reais nos testes de integração. — `compose.integration.yaml`; sem mocks nessa suíte.
-- [~] Migrations e constraints verificadas. — duas constraints, rollback e trigger de append-only verificados; `up` **e** `down` da `Migration20261024150000_PendingReferenceRetry` executados no banco de integração (colunas/índices/CHECK saem e voltam); `down` da migration inicial continua não executado.
-- [~] Concorrência, reinício e publishers concorrentes testados. — concorrência entre transações/conexões testada em PostgreSQL real, **mais duas instâncias do worker de §7.1** drenando o mesmo lote com um único crédito por linha, **dois publishers concorrentes sobre a mesma outbox** (claim único por mensagem e nenhuma perdida — `outbox-publisher.integration.e2e-spec.ts`) e **três consumidores concorrentes** processando comandos sem duplicar nem perder (`wager-command-consumer.integration.e2e-spec.ts`). Entrega "exatamente uma vez" **não** é o que esses cenários comprovam: a garantia vem da Inbox persistente, da unique de idempotência e da atomicidade. **Reinício do processo** não testado (a queda entre commit e ack é recuperada por outra instância).
+- [~] Migrations e constraints verificadas. — duas constraints, rollback e trigger de append-only verificados; `up` **e** `down` da `Migration20261024150000_PendingReferenceRetry` **e** das duas migrations de reversão (`Migration20261025120000_ReversalUniqueProcessed`, `Migration20261025160000_ReversalUniquePerReference`) executados no banco de integração; `down` da migration inicial continua não executado.
+- [~] Concorrência, reinício e publishers concorrentes testados. — concorrência entre transações/conexões testada em PostgreSQL real; **dois processos independentes** concorrendo de verdade (`multi-process.integration.e2e-spec.ts` — §8, corrida de reversão e redelivery após commit); **duas instâncias do worker de §7.1** drenando o mesmo lote com um único crédito por linha; **dois publishers concorrentes sobre a mesma outbox** (claim único por mensagem e nenhuma perdida — `outbox-publisher.integration.e2e-spec.ts`) e **três consumidores concorrentes** processando comandos sem duplicar nem perder (`wager-command-consumer.integration.e2e-spec.ts`). Entrega "exatamente uma vez" **não** é o que esses cenários comprovam: a garantia vem da Inbox persistente, da unique de idempotência e da atomicidade. **Reinício do processo** e **≥3 processos simultâneos** não testados (a queda entre commit e ack é recuperada por outra instância).
 
 ## Observabilidade — 5 pontos
-- [ ] Logs JSON sem segredos. — não implementado.
+- [ ] Logs JSON sem segredos. — não implementado (os logs existentes são os do NestJS e os estruturados dos workers, sem payload financeiro).
 - [ ] Métricas operacionais. — não implementado.
-- [ ] Liveness e readiness separados. — não implementado.
+- [x] Liveness e readiness separados. — `GET /health/live` (processo vivo) e `GET /health/ready` (PostgreSQL e SQS alcançáveis, com 503 apontando a dependência inacessível); testados em `http.integration.e2e-spec.ts`.
 
 ## Documentação — 5 pontos
 - [x] README reproduzível. — comandos de ambientes e testes documentados.
@@ -242,20 +280,21 @@ Falha eliminatória se `number`/`float`/`double` representar dinheiro.
 - [x] Trade-offs e limitações documentados. — `ARCHITECTURE.md` e `PROGRESS.md`.
 
 ## Pendências que travam a entrega
-1. Nada está commitado desde a fundação (bloqueia "Revisar Git").
-2. `WalletRepository.create` cria wallet sem os registros financeiros
+1. `WalletRepository.create` cria wallet sem os registros financeiros
    obrigatórios e fora de transação — caminho inseguro pendente de decisão.
-3. `bun run test:e2e` falha por problema conhecido de configuração do
+2. `bun run test:e2e` falha por problema conhecido de configuração do
    scaffold NestJS (enums em strip-only mode do Node 24).
-4. LOSS, REFUND e ROLLBACK: domínio pronto (factories, transições e
-   `FailureCode`, com testes), mas **sem casos de uso** nem HTTP. A **WIN**
-   foi concluída na Fase 12 (`ProcessWinUseCase`, com a política de
-   referência implementada e testada — `ARCHITECTURE.md`), restando os três
-   kinds de reversão/resultado.
-5. Múltiplas instâncias (≥3 processos) e publicação de eventos: sem teste — a
-   concorrência entre transações/conexões e entre **duas instâncias do worker
-   de §7.1** já está testada em PostgreSQL real.
+3. Execução com **≥3 processos/instâncias simultâneos** e **reinício do
+   serviço** — o que falta para encerrar de vez os riscos 4/5 e o item de
+   testes; a concorrência entre **2 processos independentes** já está
+   comprovada.
+4. Observabilidade (§12): logs JSON e métricas operacionais.
+5. Consumidor da fila de **eventos** da outbox (§11, passo 5) — quem torna a
+   duplicata de publicação segura do lado do consumidor de eventos.
+6. Reversão (`down`) da `Migration20261024021931_InitialSchema` nunca
+   executada (as demais já tiveram `up`/`down` conferidos).
 
-> Resolvido na Fase 13: `PENDING_REFERENCE` **agora tem reprocessamento** —
-> worker de §7.1 com backoff, 10 tentativas, TTL de 6 h, índices de
-> varredura e `REFERENCE_NOT_FOUND` (ver acima, em "Mensageria").
+> Resolvidos desde a última revisão: casos de uso `LOSS`/`REFUND`/`ROLLBACK`
+> com as regras do §7 (incluindo a disputa de concorrência entre processos),
+> camada HTTP completa, reconciliação, Inbox/consumidor/DLQ, publisher da
+> outbox, testes entre processos independentes e o histórico de commits.
