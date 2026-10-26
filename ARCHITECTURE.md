@@ -30,6 +30,8 @@ exigido pelo §4 é assumida e registrada aqui e no `README.md`.
 # 1. Implementado
 
 ## Estrutura de diretórios
+Representação dos **módulos principais** (arquivos de teste unitário ao lado
+do código, indicados por `+ spec`; não listados individualmente):
 ```
 src/
   domain/                          # sem dependência de NestJS, ORM ou SQS
@@ -39,31 +41,60 @@ src/
     ledger/wallet-ledger-entry.ts  # + wallet-ledger-entry.spec.ts
     wagering/wager-transaction.ts  # + wager-transaction.spec.ts
     wagering/failure-code.ts       # taxonomia README §7.2
+    messaging/inbox-message.ts     # + inbox-message.spec.ts (§6.5)
   application/
-    wallets/use-cases/open-wallet.use-case.ts     # + spec
-    wagering/use-cases/process-bet.use-case.ts    # + spec
-    wagering/use-cases/process-win.use-case.ts    # + spec
+    wallets/use-cases/open-wallet.use-case.ts       # + spec
+    wallets/use-cases/reconcile-wallet.use-case.ts  # + spec (§9)
+    wagering/use-cases/process-bet.use-case.ts      # + spec
+    wagering/use-cases/process-win.use-case.ts      # + spec
+    wagering/use-cases/process-loss.use-case.ts     # (§7)
+    wagering/use-cases/process-reversal.use-case.ts # + spec (§7, REFUND/ROLLBACK)
     wagering/use-cases/resolve-pending-references.use-case.ts # + spec (§7.1)
-    wagering/process-support.ts                   # máquina compartilhada BET/WIN
+    wagering/process-support.ts                   # máquina compartilhada BET/WIN/reversões
     wagering/reference-retry-policy.ts            # + spec (backoff/TTL §7.1)
     wagering/payload-hash.ts                      # + spec (hash canônico)
-  infrastructure/persistence/
-    entities/      # wallet, wager-transaction, wallet-ledger-entry, outbox-message, inbox-message
-    repositories/  # wallet, wallet-ledger, wager-transaction
-  infrastructure/workers/pending-reference.worker.ts  # + spec (§7.1)
-  migrations/
+    messaging/wager-transaction-requested.ts      # + spec (envelope §10)
+    messaging/consumer-error.ts                   # + spec (classificação do consumidor)
+    messaging/outbox-publisher.ts                 # porta de publicação (§11)
+    messaging/use-cases/receive-wager-transaction.use-case.ts  # + spec (Inbox §10/§11)
+    messaging/use-cases/publish-outbox-messages.use-case.ts    # + spec (§11)
+  http/                            # controllers §9 + health + metrics (§12)
+    auth.guard.ts                  # + spec — ponto de extensão de autenticação (§2, no-op)
+    http-errors.ts                 # + spec (mapeamento único de status)
+    http-exception.filter.ts
+    metrics.controller.ts          # GET /metrics (§12)
+    wallets.controller.ts / wagering.controller.ts / health.controller.ts
+  infrastructure/
+    persistence/entities/          # wallet, wager-transaction, wallet-ledger-entry,
+                                   # outbox-message, inbox-message
+    persistence/repositories/      # wallet, wallet-ledger, wager-transaction,
+                                   # inbox-message, outbox-message
+    sqs/                           # sqs-client, sqs-command-queue, sqs-outbox-publisher
+    workers/                       # pending-reference.worker (§7.1),
+                                   # outbox-publisher.worker (§11),
+                                   # wager-command-consumer.worker (§10)
+    observability/                 # metrics.ts (+ spec), structured-logger.ts (+ spec)
+  migrations/                      # 4 migrations versionadas e reversíveis
     Migration20261024021931_InitialSchema.ts
     Migration20261024150000_PendingReferenceRetry.ts
+    Migration20261025120000_ReversalUniqueProcessed.ts
+    Migration20261025160000_ReversalUniquePerReference.ts
   mikro-orm.config.ts
-  app.module.ts
+  app.module.ts / main.ts
 test/
   support/fake-entity-manager.ts                 # fake de unitário
-  integration/                                   # serviços reais
+  integration/                                   # serviços reais (PostgreSQL + LocalStack)
     support/{env,orm,sqs}.ts
+    support/child-runner.ts                      # processos independentes (§8/§13)
     postgres.integration.e2e-spec.ts
     concurrency.integration.e2e-spec.ts
     win.integration.e2e-spec.ts
     pending-reference.integration.e2e-spec.ts
+    reversal.integration.e2e-spec.ts
+    outbox-publisher.integration.e2e-spec.ts
+    wager-command-consumer.integration.e2e-spec.ts
+    multi-process.integration.e2e-spec.ts
+    http.integration.e2e-spec.ts
     sqs.integration.e2e-spec.ts
   app.e2e-spec.ts                                # scaffold NestJS (ver §4)
 ```
@@ -678,10 +709,14 @@ agendar.
 - 11 unitários do caso de uso + 12 do worker (política, agendamento,
   sobreposição, logs) — 177 testes unitários no total **na época da Fase 13**;
   para os totais atuais, consulte `PROGRESS.md`, na seção de validações.
-- 8 cenários de integração em PostgreSQL real: referência tardia + replay
-  terminal, backoff/janela, esgotamento das 10 tentativas, TTL sem esperar a
-  janela, **duas instâncias na mesma linha**, **lote 4×2 workers**, crash
-  antes do commit com recuperação e crash depois do commit.
+- 8 cenários de integração em PostgreSQL real **na época da Fase 13**
+  (referência tardia + replay terminal, backoff/janela, esgotamento das 10
+  tentativas, TTL sem esperar a janela, **duas instâncias na mesma linha**,
+  **lote 4×2 workers**, crash antes do commit com recuperação e crash depois
+  do commit); a suíte tem hoje **10 cenários** — acrescentaram-se a
+  auto-referência (a linha nunca se resolve como própria referência) e o
+  vínculo wallet ↔ transação corrompido (termina como `FAILED`, sem retry
+  infinito).
 
 ### Publicação da outbox (README §11) — `src/application/messaging/`
 
@@ -983,11 +1018,13 @@ Restam deste escopo:
 
 - `messaging`: o consumidor dos **eventos** da outbox (§11, passo 5) — quem
   torna a duplicata de publicação segura do lado dos eventos;
-- `observabilidade` (§12): logs JSON estruturados com IDs de correlação e
-  métricas operacionais;
 - `bun run test:e2e` do scaffold (falha por configuração conhecida,
   registrada em `PROGRESS.md`);
 - decisão sobre `WalletRepository.create` (remover ou tornar transacional).
+
+A **observabilidade** (§12) não é mais pendência: logs JSON estruturados,
+métricas em `GET /metrics` e health checks estão implementados (seção
+própria abaixo), com as limitações de cobertura ali registradas.
 
 Tudo o mais está implementado: os cinco casos de uso de wagering
 (`ProcessBet`, `ProcessWin`, `ProcessLoss`, `ProcessReversal`,
@@ -1021,11 +1058,15 @@ worker de §7.1** drenando o mesmo lote também estão cobertas
 (`pending-reference.integration.e2e-spec.ts`): `EntityManager` e conexões
 distintas, `SKIP LOCKED` + lock da wallet + releitura pós-lock, com um único
 crédito por linha. **Entre processos independentes** há teste próprio
-(`multi-process.integration.e2e-spec.ts`): dois processos `bun`, conexões
-próprias e largada simultânea — cenário do §8, corrida `REFUND` × `ROLLBACK`
-e redelivery após commit sem duplicar efeitos. **O que ainda não existe:**
-execução com **três ou mais processos/instâncias** simultâneos e **reinício
-do serviço**.
+(`multi-process.integration.e2e-spec.ts`): processos `bun`, conexões
+próprias e largada simultânea — cenário do §8, corrida `REFUND` × `ROLLBACK`,
+redelivery após commit sem duplicar efeitos, **quatro processos simultâneos**
+disputando o mesmo saldo (§13.4) e a **recuperação da outbox por uma nova
+instância** (o processo que comitou termina sem publicar e outro processo
+drena o pendente para o SQS real, com `balance == ledger`). **O que ainda
+não existe:** o **reinício completo do serviço** — subir o NestJS com os
+workers, encerrar com **SIGTERM** e subir de novo; a recuperação por nova
+instância acima **não** substitui esse cenário.
 
 ### Mensageria
 A entrega é at-least-once com deduplicação; não se promete exactly-once entre

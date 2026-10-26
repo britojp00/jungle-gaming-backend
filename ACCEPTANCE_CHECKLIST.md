@@ -293,7 +293,13 @@ Falha eliminatória se `number`/`float`/`double` representar dinheiro.
 ## Observabilidade — 5 pontos
 - [x] Logs JSON sem segredos. — `src/infrastructure/observability/structured-logger.ts`: `logEvent` (uma linha JSON por evento, com `correlationId`, `messageId`, `transactionId`, `walletId` e `providerId` nos pontos do consumidor) + `JsonLogger` registrado em `main.ts` para framework e workers; nenhum log carrega payload financeiro completo.
 - [x] Métricas operacionais. — `src/infrastructure/observability/metrics.ts` + `GET /metrics`: transações por status/kind, duplicatas detectadas, retries, mensagens em DLQ, conflitos de lock, outbox lag e latência de processamento. Limitação honesta: registro por processo (sem agregação entre instâncias).
-- [x] Liveness e readiness separados. — `GET /health/live` (processo vivo) e `GET /health/ready` (PostgreSQL e SQS alcançáveis, com 503 apontando a dependência inacessível); testados em `http.integration.e2e-spec.ts`.
+- [x] Liveness e readiness separados. — `GET /health/live` (processo vivo) e
+      `GET /health/ready` (PostgreSQL e SQS alcançáveis) implementados em
+      `src/http/health.controller.ts`. **Cobertura:** os caminhos de sucesso
+      (HTTP 200) têm teste de integração
+      (`http.integration.e2e-spec.ts`); o caminho de erro **HTTP 503**
+      (dependência indisponível, com a dependência `unreachable` na resposta)
+      está **implementado, mas sem teste direto**.
 
 ## Documentação — 5 pontos
 - [x] README reproduzível. — comandos de ambientes e testes documentados.
