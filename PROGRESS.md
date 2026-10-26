@@ -247,8 +247,12 @@ conflito (hash diferente) ou propaga o erro original (outra constraint, ex.:
 ### Decisão registrada
 Os testes de concorrência usam `EntityManager` e conexões distintas dentro
 de **um processo**. Múltiplas instâncias (≥3 processos) permanecem pendentes
-e não são afirmadas como validadas; o item está detalhado em `PLAN.md` e em
-`ACCEPTANCE_CHECKLIST.md` (risco eliminatório 5).
+**nesta fase** e não são afirmadas como validadas; o item está detalhado em
+`PLAN.md` e em `ACCEPTANCE_CHECKLIST.md` (risco eliminatório 5).
+*(Superado depois: a etapa de testes entre processos cobriu **4 processos
+simultâneos** disputando o mesmo saldo e a **recuperação da outbox por nova
+instância**; segue sem comprovação o **reinício completo do serviço NestJS
+com workers** — ver "Correções finais orientadas pela auditoria".)*
 
 ---
 
@@ -964,7 +968,10 @@ haviam sido registradas aqui.
   `PROCESSED`), com `up`/`down` executados e conferidos no banco de integração.
 - **Testes entre processos independentes** —
   `test/integration/multi-process.integration.e2e-spec.ts` +
-  `test/integration/support/child-runner.ts`: três cenários, cada um com
+  `test/integration/support/child-runner.ts`: três cenários nesta etapa
+  *(ampliada depois para cinco — acrescentaram-se **4 processos simultâneos**
+  disputando o mesmo saldo (§13.4) e a **recuperação da outbox por nova
+  instância**; ver "Correções finais orientadas pela auditoria")*, cada um com
   processos `bun` separados (conexões próprias, largada simultânea por
   `READY`/`GO`):
   1. §8: duas apostas de `80.00` sobre `100.00` em processos distintos →

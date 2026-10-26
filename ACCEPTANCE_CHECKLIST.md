@@ -53,8 +53,9 @@ Falha eliminatória se `number`/`float`/`double` representar dinheiro.
   cru: nunca negativo, reconciliado com o ledger e `version` coerente.
 - **Escopo honesto:** as requisições concorrentes usam `EntityManager` e
   conexões distintas dentro de um processo. A exigência de **múltiplas
-  instâncias** tem evidência com **2 processos independentes** no risco 5
-  (restam ≥3 processos simultâneos e reinício).
+  instâncias** tem evidência entre processos independentes — 2 concorrentes,
+  **4 simultâneos** e recuperação por nova instância (risco 5) —; resta sem
+  teste o **reinício do serviço Nest completo** (workers + SIGTERM).
 
 ### 3. Débito ou crédito duplicado — **Parcial**
 - **Implementado:** `ProcessBetUseCase` e `ProcessWinUseCase` fazem replay
@@ -144,10 +145,13 @@ Falha eliminatória se `number`/`float`/`double` representar dinheiro.
   constraints, atomicidade de `OpenWalletUseCase`/`ProcessWinUseCase` e fila
   SQS.
 - **Limitação honesta:** a cobertura real inclui concorrência em PostgreSQL
-  real, publicação de eventos, consumo de comandos e concorrência entre
-  **processos independentes**; **não** inclui ≥3 processos simultâneos nem
-  reinício do serviço. O requisito de não depender exclusivamente de mocks
-  está cumprido; a cobertura completa, não.
+  real, publicação de eventos, consumo de comandos, concorrência entre
+  **processos independentes** (inclusive **4 processos simultâneos**) e a
+  **recuperação da outbox por uma nova instância** (processo novo drena o
+  pendente para o SQS real); **não** inclui o **reinício completo do NestJS
+  com workers** (subir, derrubar com SIGTERM e subir de novo). O requisito de
+  não depender exclusivamente de mocks está cumprido; a cobertura completa,
+  não.
 
 ---
 

@@ -8,6 +8,23 @@ estado por requisito em `ACCEPTANCE_CHECKLIST.md` e a cronologia em
 ## Stack
 Bun 1.x, TypeScript estrito, NestJS, PostgreSQL, MikroORM, AWS SQS, LocalStack e Docker Compose.
 
+### Uso real de Bun, Node e Vitest (§4)
+O requisito oficial pede Bun 1.x como runtime, package manager e test runner;
+o uso real do projeto, sem maquiagem:
+
+- **Bun** — gerenciamento de pacotes e execução de scripts (`bun install`,
+  `bun run …`), mais o runtime das migrations (`bun --bun run migration:up`)
+  e dos processos dos testes multiprocesso (TypeScript com `enum`, que o modo
+  strip-only do Node não carrega);
+- **Node** — runtime do **comando de produção**: `bun run start:prod` executa
+  `node dist/main` (`start:dev` roda via `nest start`, também Node);
+- **Vitest** — **test runner** da suíte, sobre processos Node
+  (`bun run test`, `bun run test:integration`).
+
+Ou seja: Bun gerencia pacotes e scripts; **a aplicação em produção roda em
+Node e os testes rodam sob Vitest**. A divergência em relação ao runtime
+exigido pelo §4 é assumida e registrada aqui e no `README.md`.
+
 ---
 
 # 1. Implementado

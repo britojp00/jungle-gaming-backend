@@ -139,8 +139,9 @@ export class ReceiveWagerTransactionUseCase {
 
   /**
    * Reutiliza os MESMOS casos de uso da entrada (§10: "reutilizar o mesmo
-   * use case da entrada HTTP"). `LOSS`, `REFUND` e `ROLLBACK` ainda não têm
-   * caso de uso — o envelope os rejeita antes de chegar aqui.
+   * use case da entrada HTTP"): `BET` → `ProcessBetUseCase`, `LOSS` →
+   * `ProcessLossUseCase`, `REFUND`/`ROLLBACK` → `ProcessReversalUseCase` e
+   * `WIN` → `ProcessWinUseCase`.
    */
   private async dispatch(
     txEm: EntityManager,

@@ -107,8 +107,10 @@ podem ser aplicadas ✓ e **revertidas — não verificado**.
       `WalletRepository.findByIdForUpdate`, usado pelo `ProcessBetUseCase`;
       unique `wallets_player_currency_unique` validada sob corrida real de
       abertura. Verificado com 2, 5 e 50 apostas concorrentes na mesma wallet.
-      **Entre processos independentes** verificado depois (2 processos;
-      faltam ≥3 simultâneos e reinício).
+      **Entre processos independentes** verificado depois (2 concorrentes,
+      **4 simultâneos** disputando o mesmo saldo e recuperação da outbox por
+      nova instância; falta o **reinício completo do serviço NestJS com
+      workers**, incluindo SIGTERM).
 - [x] Implementar inbox persistente e deduplicação de mensagens.
       `InboxMessage` (§6.5) + `InboxMessageRepository`, unique
       `(consumer_name, message_id)` no banco; duplicatas e redelivery não
@@ -116,7 +118,8 @@ podem ser aplicadas ✓ e **revertidas — não verificado**.
 - [x] Implementar outbox transacional e publishers concorrentes.
       Gravação atômica nos casos de uso + `OutboxPublisherWorker` com claim
       `FOR UPDATE SKIP LOCKED`, janela gravada antes de publicar, retentativas
-      limitadas com backoff e desligamento gracioso — dois publishers
+      com backoff e **entrega eventual** (sem teto de tentativas) e
+      desligamento gracioso — dois publishers
       concorrentes testados sem perder nem duplicar indefinidamente.
 - [x] Provisionar filas SQS, DLQ e políticas de redrive no ambiente local.
       (`docker/localstack/init-queues.sh` em dev; fila de integração criada
@@ -149,10 +152,13 @@ PostgreSQL real**; eventos só são publicados após commit — **verificado**
 
 ## Dia 3 — Resiliência, testes e entrega
 - [~] Executar a aplicação em pelo menos três instâncias/processos.
-      Dois processos independentes (`bun`, conexões próprias, largada
-      simultânea) já concorrem sobre o mesmo banco
-      (`test/integration/multi-process.integration.e2e-spec.ts`); **≥3
-      processos simultâneos e reinício do serviço** continuam pendentes.
+      Quatro processos independentes (`bun`, conexões próprias, largada
+      simultânea) disputam o mesmo saldo
+      (`test/integration/multi-process.integration.e2e-spec.ts`, §13.4), e a
+      **recuperação da outbox por uma nova instância** (processo novo drena o
+      pendente para o SQS real, com `balance == ledger`) também está coberta;
+      **ainda não comprovado** o **reinício completo do serviço NestJS com
+      workers** (encerramento via SIGTERM e nova inicialização).
 - [x] Testar concorrência na mesma carteira e paralelismo entre carteiras distintas.
       (`concurrency.integration.e2e-spec.ts`: 2 e 5 apostas de 80,00 sobre
       100,00, 50 envios idênticos e apostas em carteiras distintas em paralelo,
@@ -182,15 +188,26 @@ PostgreSQL real**; eventos só são publicados após commit — **verificado**
 - [x] Implementar reconciliação entre saldo persistido e ledger.
       (`ReconcileWalletUseCase` + `POST /wallets/:walletId/reconciliation`;
       acusa divergência sem alterar dados, testado com saldo corrompido.)
-- [~] Implementar logs JSON, métricas e liveness/readiness.
+- [x] Implementar logs JSON, métricas e liveness/readiness.
       **Liveness e readiness prontos** (`/health/live`, `/health/ready`);
-      logs JSON estruturados e métricas operacionais (§12) continuam
-      pendentes.
+      **logs JSON estruturados** (`correlationId`, `messageId`,
+      `transactionId`, `walletId`, `providerId`) e **métricas operacionais**
+      em `GET /metrics` (§12, incluindo divergências de reconciliação da §9)
+      implementados; limitação conhecida: registro de métricas **por
+      processo**, sem agregação entre instâncias.
+      *Nota de cobertura de testes (lacuna de cobertura, não de
+      implementação):* o registro das métricas, o snapshot e a métrica de
+      divergência de reconciliação têm cobertura **unitária**, e o caminho de
+      **sucesso** do `/health/ready` tem teste de **integração**; não há
+      teste direto da **exposição HTTP de `GET /metrics`** nem do caminho de
+      **erro `503` do `/health/ready`** com dependência indisponível. A
+      limitação de métricas por processo, sem agregação entre instâncias,
+      permanece.
 - [x] Documentar arquitetura, trade-offs, variáveis e comandos reproduzíveis.
       (`README.md`, `ARCHITECTURE.md`, `PROGRESS.md`, `.env.example`,
       `.env.integration.example`.)
 - [x] Executar testes unitários e de integração com PostgreSQL e SQS reais em containers.
-      Harness pronto e suíte passando (258 unitários + 92 de integração),
+      Harness pronto e suíte passando (298 unitários + 95 de integração),
       incluindo concorrência real em PostgreSQL, publicação/consumo com SQS
       real e concorrência entre **processos independentes**.
 - [x] Revisar Git e confirmar que não há segredos versionados.
@@ -224,9 +241,11 @@ nesta etapa.
 
 Ainda pendente nesta frente:
 - [~] Concorrência entre múltiplas INSTÂNCIAS (processos) contra o mesmo banco —
-      **2 processos independentes** já concorrem
-      (`test/integration/multi-process.integration.e2e-spec.ts`); faltam
-      **≥3 processos simultâneos** e **reinício do serviço**.
+      **2 processos independentes** concorrem e há **4 processos simultâneos**
+      disputando o mesmo saldo, além da **recuperação da outbox por nova
+      instância** (`test/integration/multi-process.integration.e2e-spec.ts`);
+      falta o **reinício completo do serviço NestJS com workers** (SIGTERM +
+      nova inicialização).
 - [~] Reversão de migrations (`down`) verificada em banco real — `up`/`down`
       conferidos em três das quatro migrations; falta a `down` da
       `Migration20261024021931_InitialSchema`.
@@ -282,18 +301,20 @@ política de referência do `WIN`").
 HTTP), **7** (Inbox, retries, backoff e DLQ do consumidor) e a
 **reconciliação** de 8, além de os testes entre **processos independentes**
 terem entrado na frente de **6**. Seguem pendentes: **2**
-(`WalletRepository.create`), o restante de **6** (≥3 processos simultâneos e
-reinício do serviço) e a **observabilidade** (§12). Ordem por dependência —
+(`WalletRepository.create`) e o restante de **6** (**reinício completo do
+serviço NestJS com workers**, incluindo SIGTERM). Ordem por dependência —
 cada etapa destrava a seguinte:
 
 1. **Decidir o destino de `WalletRepository.create`** (remover ou tornar
    transacional). É um caminho inseguro que pode ser chamado por engano.
-2. **Testes com ≥3 processos/instâncias simultâneos** e com **reinício do
-   serviço** — encerra a frente de concorrência e idempotência (os testes com
-   2 processos independentes já cobrem §8, corrida de reversão e redelivery
-   após commit).
-3. **Observabilidade (§12)** — logs JSON estruturados com IDs de correlação e
-   métricas operacionais.
+2. **Reinício completo do serviço NestJS com workers** (SIGTERM + nova
+   inicialização) — encerra a frente de concorrência e idempotência. Os
+   testes entre processos independentes já cobrem §8, corrida de reversão,
+   redelivery após commit, **4 processos simultâneos** disputando o saldo e a
+   **recuperação da outbox por nova instância**.
+3. ~~**Observabilidade (§12)** — logs JSON estruturados com IDs de correlação
+   e métricas operacionais.~~ Concluída no mínimo do contrato (ver acima);
+   limitação conhecida: métricas por processo, sem agregação entre instâncias.
 4. **Consumidor da fila de eventos** da outbox (§11, passo 5) — quem torna a
    duplicata de publicação segura do lado dos eventos.
 5. **Corrigir `bun run test:e2e`** (configuração do scaffold NestJS).
