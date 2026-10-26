@@ -305,6 +305,83 @@ describe('ProcessWinUseCase — referência compatível (regra 2)', () => {
   });
 });
 
+describe('ProcessWinUseCase — elegibilidade da referência (política do ARCHITECTURE.md)', () => {
+  // Regra 2 do §7 resolve a referência por chave + identidade (provider,
+  // player, wallet, moeda, rodada) e **não** impõe condição de status ou de
+  // kind ao alvo — exigência de `BET` `PROCESSED` existe apenas para
+  // `REFUND`/`ROLLBACK` (tabela §7 + regra 3). A tabela §7 define o efeito
+  // da `WIN` como crédito, e a referência é **opcional** ("pode referenciar
+  // a `BET` da mesma rodada"). Portanto o crédito **não** depende do estado
+  // do alvo: o que se rejeita é identidade divergente (casos acima), não
+  // resultado. Decisão deliberada registrada em `ARCHITECTURE.md`
+  // ("Decisão — política de referência do `WIN`", item 3).
+  const eligibilityCases: Array<{
+    label: string;
+    target: Record<string, unknown>;
+  }> = [
+    {
+      label: 'BET REJECTED',
+      target: {
+        kind: WagerTransactionKind.BET,
+        status: WagerTransactionStatus.REJECTED,
+      },
+    },
+    {
+      label: 'LOSS',
+      target: {
+        kind: WagerTransactionKind.LOSS,
+        status: WagerTransactionStatus.PROCESSED,
+      },
+    },
+    {
+      label: 'REFUND',
+      target: {
+        kind: WagerTransactionKind.REFUND,
+        status: WagerTransactionStatus.PROCESSED,
+      },
+    },
+    {
+      label: 'alvo ainda PENDING_REFERENCE',
+      target: {
+        kind: WagerTransactionKind.BET,
+        status: WagerTransactionStatus.PENDING_REFERENCE,
+      },
+    },
+  ];
+
+  for (const eligibilityCase of eligibilityCases) {
+    it(`credita quando a referência é ${eligibilityCase.label} (identidade da regra 2 satisfeita)`, async () => {
+      const fake = new FakeEntityManager();
+      fake.seed(WalletEntity, seededWalletRow('100.00'));
+      fake.seed(
+        WagerTransactionEntity,
+        seededReferenceRow(eligibilityCase.target),
+      );
+      const useCase = new ProcessWinUseCase(fake.asEntityManager());
+
+      const result = await useCase.execute(
+        winInput({ referenceExternalTransactionId: 'bet-777' }),
+      );
+
+      expect(result.status).toBe(WagerTransactionStatus.PROCESSED);
+      expect(result.balance).toEqual({ amount: '125.00', currency: 'BRL' });
+      expect(result.failureCode).toBeUndefined();
+
+      const row = fake
+        .rows<WagerTransactionEntity>(WagerTransactionEntity)
+        .find((candidate) => candidate.kind === WagerTransactionKind.WIN)!;
+      expect(row.status).toBe(WagerTransactionStatus.PROCESSED);
+      expect(row.referenceTransaction).toEqual(
+        expect.objectContaining({ id: TARGET_ID }),
+      );
+
+      const entries = fake.rows<WalletLedgerEntryEntity>(WalletLedgerEntryEntity);
+      expect(entries).toHaveLength(1);
+      expect(entries[0]!.direction).toBe(LedgerDirection.CREDIT);
+    });
+  }
+});
+
 describe('ProcessWinUseCase — divergência em cada vínculo da regra 2', () => {
   const mismatchCases: Array<{
     label: string;

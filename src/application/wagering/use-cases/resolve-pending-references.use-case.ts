@@ -32,6 +32,7 @@ import {
   nextReferenceAttemptAt,
   shouldRejectMissingReference,
 } from '../reference-retry-policy.js';
+import { metrics } from '../../../infrastructure/observability/metrics.js';
 
 /** Linhas por tick: o suficiente para drenar uma fila normal num ciclo. */
 export const DEFAULT_PENDING_REFERENCE_CLAIM_LIMIT = 20;
@@ -205,8 +206,16 @@ export class ResolvePendingReferencesUseCase {
           });
         } else if (outcome === 'stillPending') {
           result.stillPending += 1;
+          metrics.increment('retries_total', {
+            component: 'pending_reference',
+          });
         } else {
           result.skipped += 1;
+          // Outra instância concluiu a linha entre o claim e o lock (§12:
+          // conflitos de lock — resolvidos pela releitura após o lock).
+          metrics.increment('lock_conflicts_total', {
+            scope: 'pending_reference',
+          });
         }
       } catch (error) {
         result.problems.push({

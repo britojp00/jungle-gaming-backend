@@ -655,7 +655,7 @@ roda na mesma transação do saldo/ledger, comprovado por rollback real. O que
 este incremento cobre é a **publicação** do que ficou confirmado:
 
 1. **claim numa transação curta** — `SELECT … WHERE status = 'PENDING' AND
-   next_attempt_at <= now AND attempts < 10 … LIMIT n FOR UPDATE SKIP LOCKED`
+   next_attempt_at <= now … LIMIT n FOR UPDATE SKIP LOCKED`
    (índice `outbox_status_next_attempt_idx`), com a tentativa contada e a
    próxima janela gravadas **antes** de soltar a linha;
 2. **publicação fora da transação** — o SQS é externo e não participa do
@@ -669,8 +669,8 @@ este incremento cobre é a **publicação** do que ficou confirmado:
 | `MessageGroupId` | `aggregateId` | FIFO exige agrupador; eventos do mesmo agregado preservam a ordem |
 | `MessageDeduplicationId` | id da mensagem (é o `eventId`) | **proteção adicional**: absorve reenvios muito próximos dentro da janela do broker — não é a garantia final (§8) |
 | quando a tentativa é contada | no claim, como na §7.1 | a queda entre claim e publicação consome um slot e mantém a mensagem elegível |
-| limite e backoff | 10 tentativas, `5 s × 2^(n−1)` com teto de 15 min | o único padrão de retry do projeto (`reference-retry-policy.ts`), reutilizado |
-| mensagem esgotada | continua `PENDING` e deixa de ser reivindicada | não inventar semântica de fila morta; nada se perde e tudo fica auditável |
+| limite e backoff | sem teto de tentativas; backoff `5 s × 2^(n−1)` com teto de 15 min (`reference-retry-policy.ts`) | o evento já foi **confirmado no commit**, então §3 ("não perder eventos confirmados") e §11 ("sem perder nem duplicar indefinidamente") exigem entrega eventual; o teto limita a cadência, não a entrega |
+| mensagem esgotada | segue `PENDING` e volta a ser reivindicada na janela de backoff | o orçamento de tentativas (10) foi removido após auditoria: com ele, uma mensagem que esgotasse as tentativas ficaria `PENDING` para sempre sem publicação — perda de evento confirmado |
 | `status = PROCESSING`, `locked_at`, `lock_owner` | **não usados** | o esqueleto oficial (§6.5) só prevê `isPending`/`isDue`/`markPublished`/`scheduleRetry`, e a janela gravada no claim já impede claim duplo sem deixar lock órfão |
 
 **Nada se perde:** uma queda entre o claim e a publicação deixa a mensagem
@@ -771,6 +771,31 @@ estar documentado"):
 - O header `Idempotency-Key` e metadados de transporte não participam: o
   tipo `WagerPayload` nem os aceita (garantia de tipo, testada).
 - `roundId`/`gameId` já participavam.
+
+### Observabilidade (README §12) — `src/infrastructure/observability/`
+
+Etapa final de entrega (o §12 marca o item como obrigatório; OpenTelemetry e
+dashboard são opcionais):
+
+- **logs estruturados (JSON)** — `structured-logger.ts`: `logEvent` emite uma
+  linha JSON por evento de ciclo de vida (comandos consumidos, retry, DLQ)
+  com `correlationId`, `messageId`, `transactionId`, `walletId` e
+  `providerId`; `JsonLogger` (adapter `LoggerService`, registrado em
+  `main.ts`) faz framework e workers saírem no mesmo formato. Nenhum log
+  carrega payload financeiro completo — só identificadores e motivos.
+- **métricas** — `metrics.ts`: registro em memória (contadores, gauges e
+  durações), sem dependências novas, exposto em `GET /metrics` como JSON.
+  Cobre o mínimo do §12: `wager_transactions_total{status,kind}`,
+  `duplicates_detected_total{source}`, `retries_total{component}`,
+  `dlq_messages_total`, `lock_conflicts_total{scope}`, `outbox_lag_ms` e
+  `processing_latency_ms{component}`. Instrumentação nos pontos reais:
+  `toProcessResult`/`resolveConcurrentDuplicate` (process-support),
+  publicação da outbox, resolução de referências pendentes e consumidor.
+- **limitação honesta:** o registro é **por processo**; com múltiplas
+  instâncias, cada `/metrics` reporta a própria instância. Agregar seria
+  exporter/OTel (opcional no §12), fora do escopo desta entrega.
+- **health checks** — já existentes e separados (`/health/live`,
+  `/health/ready`).
 
 ## Contrato do evento `WalletBalanceChanged` (README §11)
 Aplicado por `OpenWalletUseCase`, `ProcessBetUseCase` e `ProcessWinUseCase`:

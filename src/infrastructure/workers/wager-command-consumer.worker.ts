@@ -18,6 +18,8 @@ import {
 } from '../../application/messaging/wager-transaction-requested.js';
 import { SqsCommandQueue } from '../sqs/sqs-command-queue.js';
 import type { SqsReceivedMessage } from '../sqs/sqs-client.js';
+import { metrics } from '../observability/metrics.js';
+import { logEvent } from '../observability/structured-logger.js';
 
 /** Intervalo padrão entre ciclos. */
 export const DEFAULT_CONSUMER_POLL_MS = 5_000;
@@ -170,7 +172,13 @@ export class WagerCommandConsumerWorker
       result.received = messages.length;
 
       for (const message of messages) {
+        // §12: latência de processamento por mensagem consumida.
+        const stopTimer = metrics.startDuration('processing_latency_ms', {
+          component: 'consumer',
+        });
+
         await this.handleMessage(message, now, result);
+        stopTimer();
       }
     } catch (error) {
       // Banco ou SQS indisponível: nada foi confirmado, então as mensagens
@@ -217,6 +225,22 @@ export class WagerCommandConsumerWorker
       // e volta pela visibilidade — sem efeito novo (a Inbox já garante).
       result[outcome.outcome] += 1;
 
+      if (outcome.outcome === 'duplicate') {
+        metrics.increment('duplicates_detected_total', { source: 'inbox' });
+      }
+
+      // §12: log estruturado por mensagem, com os identificadores do fluxo —
+      // sem payload financeiro.
+      logEvent('log', 'command_processed', {
+        correlationId: message.messageId,
+        messageId: message.messageId,
+        transactionId: outcome.transactionId,
+        walletId: envelope.data.walletId,
+        providerId: envelope.data.providerId,
+        outcome: outcome.outcome,
+        status: outcome.status,
+      });
+
       await this.queue.acknowledge(message.receiptHandle);
     } catch (error) {
       if (isInboxDuplicate(error)) {
@@ -224,6 +248,7 @@ export class WagerCommandConsumerWorker
         // único só acusa depois de a transação concorrente confirmar.
         await this.queue.acknowledge(message.receiptHandle);
         result.duplicate += 1;
+        metrics.increment('duplicates_detected_total', { source: 'inbox' });
 
         return;
       }
@@ -237,6 +262,14 @@ export class WagerCommandConsumerWorker
       // Transitório: NÃO confirmar. A visibilidade do SQS reentrega e o
       // `maxReceiveCount` da fila decide quando vai para a DLQ.
       result.retried += 1;
+      metrics.increment('retries_total', { component: 'consumer' });
+      logEvent('warn', 'command_retry', {
+        correlationId: message.messageId,
+        messageId: message.messageId,
+        walletId: envelope.data.walletId,
+        providerId: envelope.data.providerId,
+        reason: error instanceof Error ? error.message : String(error),
+      });
       this.logger.error(
         `falha transitória ao processar comando ${message.messageId}: ${
           error instanceof Error ? error.message : String(error)
@@ -258,6 +291,13 @@ export class WagerCommandConsumerWorker
     await this.queue.acknowledge(message.receiptHandle);
 
     result.deadLettered += 1;
+    // §12: mensagens em DLQ, com o motivo — sem o payload financeiro.
+    metrics.increment('dlq_messages_total');
+    logEvent('error', 'command_dead_lettered', {
+      correlationId: message.messageId,
+      messageId: message.messageId,
+      reason: error instanceof Error ? error.message : String(error),
+    });
     this.logger.error(
       `comando ${message.messageId} encaminhado para a DLQ: ${
         error instanceof Error ? error.message : String(error)

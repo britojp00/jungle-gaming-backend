@@ -15,6 +15,7 @@ import {
   OutboxMessageEntity,
   OutboxMessageStatus,
 } from '../../infrastructure/persistence/entities/outbox-message.entity.js';
+import { metrics } from '../../infrastructure/observability/metrics.js';
 
 /**
  * Máquina compartilhada dos casos de uso que aplicam uma `WagerTransaction`
@@ -250,6 +251,18 @@ export function toProcessResult(
     throw new Error('TRANSACTION_RESULT_NOT_AVAILABLE');
   }
 
+  // §12: transações por status, e replay contado como duplicata detectada.
+  metrics.increment('wager_transactions_total', {
+    status: transaction.status,
+    kind: transaction.kind,
+  });
+
+  if (replayed) {
+    metrics.increment('duplicates_detected_total', {
+      source: 'idempotent_replay',
+    });
+  }
+
   return {
     transactionId: transaction.id,
     status: transaction.status,
@@ -315,6 +328,11 @@ export async function resolveConcurrentDuplicate<T>(
   if (!existing) {
     throw originalError;
   }
+
+  // §12: a corrida de idempotência vencida pela unique é o conflito de lock
+  // que o schema resolveu — contado como duplicata detectada e conflito.
+  metrics.increment('lock_conflicts_total', { scope: 'idempotency' });
+  metrics.increment('duplicates_detected_total', { source: 'idempotency_race' });
 
   if (existing.payloadHash !== payloadHash) {
     throw new Error('IDEMPOTENCY_PAYLOAD_CONFLICT');

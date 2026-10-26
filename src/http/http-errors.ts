@@ -33,7 +33,18 @@ export function httpError(error: unknown): HttpException {
     message === 'REFERENCE_ALREADY_REVERSED' ||
     error instanceof UniqueConstraintViolationException
   ) {
-    return new HttpException({ message }, HttpStatus.CONFLICT);
+    // A mensagem crua do banco (constraint, SQL) nunca vai para o cliente:
+    // quem viola a unique recebe o código estável, o diagnóstico fica no log
+    // do servidor (README §12).
+    return new HttpException(
+      {
+        message:
+          error instanceof UniqueConstraintViolationException
+            ? 'UNIQUE_CONSTRAINT_VIOLATION'
+            : message,
+      },
+      HttpStatus.CONFLICT,
+    );
   }
 
   if (error instanceof InvalidEnvelopeError || isInvalidPayload(message)) {
@@ -41,15 +52,28 @@ export function httpError(error: unknown): HttpException {
   }
 
   // Qualquer outra coisa é infraestrutura (banco/SQS fora, timeout…):
-  // transitória, e portanto 503 — nunca 500 silencioso.
-  return new HttpException({ message }, HttpStatus.SERVICE_UNAVAILABLE);
+  // transitória, e portanto 503 — nunca 500 silencioso. Mensagens internas
+  // (driver, SQL, stack) não são expostas: código estável para o provedor
+  // decidir reenviar, diagnóstico no log do servidor (README §12).
+  return new HttpException(
+    { message: 'INTERNAL_ERROR' },
+    HttpStatus.SERVICE_UNAVAILABLE,
+  );
 }
 
-/** Erros de validação de payload/domínio — o conteúdo nunca vai passar. */
+/**
+ * Erros de validação de payload/domínio — o conteúdo nunca vai passar, nem
+ * com reentrega (o provedor deve corrigir o payload). Inclui os códigos
+ * estáveis de divergência de identidade: `WALLET_PLAYER_MISMATCH` e
+ * `CURRENCY_MISMATCH` não se corrigem esperando (a wallet não muda de player
+ * nem de moeda), logo não são falha transitória.
+ */
 function isInvalidPayload(message: string): boolean {
   return (
     message.startsWith('INVALID_') ||
     message.startsWith('Invalid') ||
+    message === 'WALLET_PLAYER_MISMATCH' ||
+    message === 'CURRENCY_MISMATCH' ||
     message.includes('is required') ||
     message.includes('must be') ||
     message.includes('does not support') ||
@@ -58,6 +82,7 @@ function isInvalidPayload(message: string): boolean {
     message.includes('Currency mismatch') ||
     message.includes('Insufficient') ||
     message.includes('cannot be negative') ||
+    message.includes('exceeds numeric') ||
     message.includes('Idempotency-Key')
   );
 }

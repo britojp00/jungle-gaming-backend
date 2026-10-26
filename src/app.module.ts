@@ -6,6 +6,7 @@ import mikroOrmConfig from './mikro-orm.config.js';
 import { AppController } from './app.controller.js';
 import { AppService } from './app.service.js';
 import { HealthController } from './http/health.controller.js';
+import { MetricsController } from './http/metrics.controller.js';
 import { WalletsController } from './http/wallets.controller.js';
 import { WageringController } from './http/wagering.controller.js';
 import { HttpExceptionFilter } from './http/http-exception.filter.js';
@@ -22,6 +23,8 @@ import { SqsOutboxPublisher } from './infrastructure/sqs/sqs-outbox-publisher.js
     WalletsController,
     WageringController,
     HealthController,
+    // Métricas operacionais em JSON (README §12).
+    MetricsController,
   ],
   providers: [
     AppService,

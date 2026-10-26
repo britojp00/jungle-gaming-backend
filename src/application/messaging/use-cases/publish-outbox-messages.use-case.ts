@@ -4,10 +4,8 @@ import {
   OutboxMessageRepository,
   OutboxClaim,
 } from '../../../infrastructure/persistence/repositories/outbox-message.repository.js';
-import {
-  REFERENCE_RETRY_MAX_ATTEMPTS,
-  referenceRetryDelayMs,
-} from '../../wagering/reference-retry-policy.js';
+import { metrics } from '../../../infrastructure/observability/metrics.js';
+import { referenceRetryDelayMs } from '../../wagering/reference-retry-policy.js';
 import {
   OutboxPublisher,
   OutboxPublishing,
@@ -75,11 +73,14 @@ export interface PublishOutboxMessagesResult {
  * persistente por `(consumerName, messageId)` que a §10 exige (fora desta
  * etapa).
  *
- * Retentativas **limitadas**: cada tentativa é contada no próprio claim e a
- * espera cresce com o backoff já adotado (5 s × 2^(n−1), teto 15 min);
- * esgotadas as `REFERENCE_RETRY_MAX_ATTEMPTS`, a mensagem continua na outbox
- * — auditável, não reivindicada, **sem** ganhar estado novo nem semântica de
- * fila morta.
+ * Retentativas **limitadas em cadência, não em entrega**: cada tentativa é
+ * contada no próprio claim e a espera cresce com o backoff já adotado
+ * (5 s × 2^(n−1), teto 15 min). O evento já foi confirmado no commit, então
+ * não há orçamento de tentativas que o descarte: esgotado qualquer limite, a
+ * mensagem continuaria `PENDING` sem nunca ser publicada (§3: "não perder
+ * eventos confirmados"; §11: "sem perder nem duplicar indefinidamente"). O
+ * que limita a carga é o teto de 15 min entre tentativas — a mensagem segue
+ * auditável, sem ganhar estado novo nem semântica de fila morta.
  */
 export class PublishOutboxMessagesUseCase {
   constructor(
@@ -109,17 +110,34 @@ export class PublishOutboxMessagesUseCase {
         payload: message.payload,
       };
 
+      // §12: outbox lag = idade do evento confirmado ainda não publicado.
+      const occurredAtRaw: unknown = message.payload['occurredAt'];
+      const occurredAt = Date.parse(
+        typeof occurredAtRaw === 'string' ? occurredAtRaw : '',
+      );
+
+      if (Number.isFinite(occurredAt)) {
+        metrics.observeDuration('outbox_lag_ms', now.getTime() - occurredAt);
+      }
+
+      const stopPublishTimer = metrics.startDuration('processing_latency_ms', {
+        component: 'outbox_publish',
+      });
+
       try {
         await this.publisher.publish(publishing);
+        stopPublishTimer();
         await this.markPublished(message.id, now);
         result.published += 1;
       } catch (error) {
+        stopPublishTimer();
         const detail = error instanceof Error ? error.message : String(error);
 
         // Tentativa e próxima janela já foram gravadas no claim: a mensagem
         // volta a ser elegível sozinha. Só se registra o motivo — nunca o
         // payload financeiro (README §12).
         await this.recordFailure(message.id, detail);
+        metrics.increment('retries_total', { component: 'outbox' });
 
         result.failed += 1;
         result.problems.push({
@@ -137,11 +155,7 @@ export class PublishOutboxMessagesUseCase {
   private async claim(limit: number, now: Date): Promise<OutboxClaim[]> {
     return this.em.transactional(async (txEm) => {
       const repository = new OutboxMessageRepository(txEm);
-      const messages = await repository.claimPublishable(
-        limit,
-        REFERENCE_RETRY_MAX_ATTEMPTS,
-        now,
-      );
+      const messages = await repository.claimPublishable(limit, now);
 
       for (const message of messages) {
         const attempts = message.attempts + 1;

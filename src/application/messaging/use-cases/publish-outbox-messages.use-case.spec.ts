@@ -117,18 +117,16 @@ describe('PublishOutboxMessagesUseCase — claim e publicação', () => {
       problems: [],
     });
 
-    // A consulta é a da §11: só `PENDING`, dentro da janela e com tentativas
-    // sobrando — o limite de retentativas vale já na seleção.
+    // A consulta é a da §11: só `PENDING` e dentro da janela — sem teto de
+    // tentativas na seleção, para que todo evento confirmado chegue a ser
+    // publicado (§3: "não perder eventos confirmados").
     expect(fake.executed).toHaveLength(1);
     expect(fake.executed[0]!.sql).toMatch(/for update skip locked/i);
     expect(fake.executed[0]!.sql).toMatch(
-      /status = 'PENDING'[\s\S]*next_attempt_at <= \?[\s\S]*attempts < \?/i,
+      /status = 'PENDING'[\s\S]*next_attempt_at <= \?/i,
     );
-    expect(fake.executed[0]!.params).toEqual([
-      NOW,
-      REFERENCE_RETRY_MAX_ATTEMPTS,
-      20,
-    ]);
+    expect(fake.executed[0]!.sql).not.toMatch(/attempts < \?/i);
+    expect(fake.executed[0]!.params).toEqual([NOW, 20]);
 
     // O payload sai do jeito que entrou: o worker não reescreve o contrato.
     expect(publisher.sent).toEqual([
@@ -270,23 +268,44 @@ describe('PublishOutboxMessagesUseCase — falha de publicação', () => {
   });
 });
 
-describe('PublishOutboxMessagesUseCase — retentativas limitadas', () => {
-  it('só reivindica mensagens com tentativas sobrando', async () => {
+describe('PublishOutboxMessagesUseCase — entrega eventual', () => {
+  it('publica também a mensagem com tentativas já esgotadas (nada se perde)', async () => {
     const fake = new FakeEntityManager();
-    fake.claimRows = [];
+    // Orçamento antigo esgotado: antes, a linha nunca mais era reivindicada e
+    // o evento confirmado no commit se perdia para sempre.
+    fake.seed(
+      OutboxMessageEntity,
+      seededMessage(MESSAGE_ID, {
+        attempts: REFERENCE_RETRY_MAX_ATTEMPTS,
+        lastError: 'SQS indisponível',
+      }),
+    );
+    fake.claimRows = [
+      claimRowFor(MESSAGE_ID, { attempts: REFERENCE_RETRY_MAX_ATTEMPTS }),
+    ];
 
+    const publisher = new StubPublisher();
     const useCase = new PublishOutboxMessagesUseCase(
       fake.asEntityManager(),
-      new StubPublisher(),
+      publisher,
     );
 
-    await useCase.execute({ now: NOW });
+    const result = await useCase.execute({ now: NOW });
 
-    // O filtro `attempts < limite` está na própria seleção: esgotadas as
-    // tentativas, a mensagem continua na outbox (auditável) e não volta a
-    // ser reivindicada — sem inventar estado de "mensagem morta".
-    expect(fake.executed[0]!.sql).toMatch(/attempts < \?/i);
-    expect(fake.executed[0]!.params).toContain(REFERENCE_RETRY_MAX_ATTEMPTS);
+    expect(result).toMatchObject({ claimed: 1, published: 1, failed: 0 });
+    expect(publisher.sent.map((message) => message.messageId)).toEqual([
+      MESSAGE_ID,
+    ]);
+
+    // A seleção não tem teto de tentativas: o backoff limita a cadência
+    // (teto 15 min), nunca a entrega.
+    expect(fake.executed[0]!.sql).not.toMatch(/attempts < \?/i);
+    expect(fake.executed[0]!.params).toEqual([NOW, 20]);
+
+    const row = messageRow(fake);
+    expect(row['status']).toBe(OutboxMessageStatus.PUBLISHED);
+    expect(row['attempts']).toBe(REFERENCE_RETRY_MAX_ATTEMPTS + 1);
+    expect(row['lastError']).toBeNull();
   });
 });
 

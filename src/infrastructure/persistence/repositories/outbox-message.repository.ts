@@ -42,27 +42,24 @@ export class OutboxMessageRepository {
    *   própria transação do claim (como no worker da §7.1) é o que impede que
    *   dois publishers levem a MESMA mensagem: quem chega depois pula a linha
    *   (`FOR UPDATE SKIP LOCKED`) ou a encontra fora da janela;
-   * - `attempts < limite` — retentativas limitadas: esgotadas, a mensagem
-   *   continua na tabela (não se perde, não ganha estado novo) e deixa de ser
-   *   selecionada;
+   * - **sem teto de tentativas**: o evento já foi confirmado no commit, então
+   *   §3 ("não perder eventos confirmados") e §11 ("sem perder nem duplicar
+   *   indefinidamente") exigem entrega eventual — esgotado qualquer orçamento
+   *   de retentativa, a mensagem ficaria `PENDING` para sempre sem ser
+   *   publicada. O backoff (teto de 15 min) limita a cadência, não a entrega;
    * - `order by next_attempt_at, created_at` é o mesmo caminho do índice
    *   `outbox_status_next_attempt_idx`.
    */
-  async claimPublishable(
-    limit: number,
-    maxAttempts: number,
-    now: Date,
-  ): Promise<OutboxClaim[]> {
+  async claimPublishable(limit: number, now: Date): Promise<OutboxClaim[]> {
     const rows = await this.em.execute(
       `select id, event_type, aggregate_id, payload, attempts
          from outbox_messages
         where status = 'PENDING'
           and next_attempt_at <= ?
-          and attempts < ?
         order by next_attempt_at, created_at
         limit ?
         for update skip locked`,
-      [now, maxAttempts, limit],
+      [now, limit],
     );
 
     return rows.map((row) => ({

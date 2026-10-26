@@ -203,8 +203,14 @@ Falha eliminatória se `number`/`float`/`double` representar dinheiro.
       (`multi-process.integration.e2e-spec.ts`: o processo que faz o commit
       sai **sem** ack; outro processo recebe a reentrega, responde `duplicate`
       e o saldo segue `75.00`).
-- [x] Retries, backoff e DLQ testados. — **outbox**: retentativa limitada (10)
-      com backoff `5 s × 2^(n−1)` (teto 15 min); **consumidor**: reentrega por
+- [x] Retries, backoff e DLQ testados. — **outbox**: retentativa **sem teto de
+      tentativas** (entrega eventual do evento já confirmado — §3/§11), com
+      backoff `5 s × 2^(n−1)` (teto 15 min); o orçamento de 10 tentativas foi
+      removido na correção de auditoria porque esgotá-lo deixava a mensagem
+      `PENDING` para sempre (evento confirmado perdido) — coberto por teste
+      unitário e por cenário em PostgreSQL real
+      (`outbox-publisher.integration`: "mensagem com tentativas esgotadas
+      ainda é publicada"); **consumidor**: reentrega por
       visibilidade do SQS para transitórios e DLQ para permanentes, com
       `maxReceiveCount` levando à DLQ quando o limite vence — tudo em
       PostgreSQL + LocalStack reais.
@@ -264,14 +270,14 @@ Falha eliminatória se `number`/`float`/`double` representar dinheiro.
       **mapeamento HTTP** está fechado em `src/http` (400/404/409/422/202/503).
 
 ## Testes — 10 pontos
-- [x] Testes unitários e de integração. — 258 unitários + 92 de integração (8 PostgreSQL + 8 concorrência + 10 WIN + 10 referência pendente + 7 outbox + 6 consumo de comandos + 4 SQS + 16 HTTP + 20 reversões + 3 entre processos).
+- [x] Testes unitários e de integração. — 289 unitários + 93 de integração (8 PostgreSQL + 8 concorrência + 10 WIN + 10 referência pendente + 8 outbox + 6 consumo de comandos + 4 SQS + 16 HTTP + 20 reversões + 3 entre processos).
 - [x] PostgreSQL e SQS reais nos testes de integração. — `compose.integration.yaml`; sem mocks nessa suíte.
 - [~] Migrations e constraints verificadas. — duas constraints, rollback e trigger de append-only verificados; `up` **e** `down` da `Migration20261024150000_PendingReferenceRetry` **e** das duas migrations de reversão (`Migration20261025120000_ReversalUniqueProcessed`, `Migration20261025160000_ReversalUniquePerReference`) executados no banco de integração; `down` da migration inicial continua não executado.
 - [~] Concorrência, reinício e publishers concorrentes testados. — concorrência entre transações/conexões testada em PostgreSQL real; **dois processos independentes** concorrendo de verdade (`multi-process.integration.e2e-spec.ts` — §8, corrida de reversão e redelivery após commit); **duas instâncias do worker de §7.1** drenando o mesmo lote com um único crédito por linha; **dois publishers concorrentes sobre a mesma outbox** (claim único por mensagem e nenhuma perdida — `outbox-publisher.integration.e2e-spec.ts`) e **três consumidores concorrentes** processando comandos sem duplicar nem perder (`wager-command-consumer.integration.e2e-spec.ts`). Entrega "exatamente uma vez" **não** é o que esses cenários comprovam: a garantia vem da Inbox persistente, da unique de idempotência e da atomicidade. **Reinício do processo** e **≥3 processos simultâneos** não testados (a queda entre commit e ack é recuperada por outra instância).
 
 ## Observabilidade — 5 pontos
-- [ ] Logs JSON sem segredos. — não implementado (os logs existentes são os do NestJS e os estruturados dos workers, sem payload financeiro).
-- [ ] Métricas operacionais. — não implementado.
+- [x] Logs JSON sem segredos. — `src/infrastructure/observability/structured-logger.ts`: `logEvent` (uma linha JSON por evento, com `correlationId`, `messageId`, `transactionId`, `walletId` e `providerId` nos pontos do consumidor) + `JsonLogger` registrado em `main.ts` para framework e workers; nenhum log carrega payload financeiro completo.
+- [x] Métricas operacionais. — `src/infrastructure/observability/metrics.ts` + `GET /metrics`: transações por status/kind, duplicatas detectadas, retries, mensagens em DLQ, conflitos de lock, outbox lag e latência de processamento. Limitação honesta: registro por processo (sem agregação entre instâncias).
 - [x] Liveness e readiness separados. — `GET /health/live` (processo vivo) e `GET /health/ready` (PostgreSQL e SQS alcançáveis, com 503 apontando a dependência inacessível); testados em `http.integration.e2e-spec.ts`.
 
 ## Documentação — 5 pontos
@@ -288,7 +294,9 @@ Falha eliminatória se `number`/`float`/`double` representar dinheiro.
    serviço** — o que falta para encerrar de vez os riscos 4/5 e o item de
    testes; a concorrência entre **2 processos independentes** já está
    comprovada.
-4. Observabilidade (§12): logs JSON e métricas operacionais.
+4. ~~Observabilidade (§12): logs JSON e métricas operacionais.~~ **Resolvido**
+   nesta entrega: logs estruturados em JSON e métricas em `GET /metrics` (ver
+   seção Observabilidade).
 5. Consumidor da fila de **eventos** da outbox (§11, passo 5) — quem torna a
    duplicata de publicação segura do lado do consumidor de eventos.
 6. Reversão (`down`) da `Migration20261024021931_InitialSchema` nunca

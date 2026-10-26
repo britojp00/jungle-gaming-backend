@@ -43,7 +43,8 @@ import { createSqsHttp, type SqsHttp } from './support/sqs.js';
  * 2. recuperação após interrupção **antes** da publicação;
  * 3. dois publishers concorrentes sem perda nem claim simultâneo indevido;
  * 4. falha de publicação e retentativa;
- * 5. rollback da transação financeira não deixa evento para publicar.
+ * 5. rollback da transação financeira não deixa evento para publicar;
+ * 6. tentativas esgotadas não descartam o evento confirmado (entrega eventual).
  *
  * Em todos: o corpo publicado é o payload gravado, sem alteração de conteúdo
  * (as comparações são entre objetos JSON parseados, não entre bytes).
@@ -555,6 +556,48 @@ describe('Outbox (§11) — evento e publicação', () => {
     expect(retried).toMatchObject({ claimed: total, published: total });
     expect((await receiveMessages()).map((m) => m.body).sort(byEventId)).toEqual(
       (await readOutboxRows()).map((row) => row.payload).sort(byEventId),
+    );
+  }, 30_000);
+
+  it('mensagem com tentativas esgotadas ainda é publicada — evento confirmado não se perde', async () => {
+    const playerId = `it-outbox-exhausted-${randomUUID()}`;
+    const wallet = await openWallet(playerId, '100.00');
+    await processWin(winInput(wallet.id, playerId));
+
+    const total = (await readOutboxRows()).length;
+
+    // Falhas temporárias repetidas do SQS consomem qualquer orçamento de
+    // retentativa: a linha fica `PENDING`, com tentativas acumuladas.
+    await orm.em.getConnection().execute(
+      `update outbox_messages
+          set attempts = 10,
+              last_error = 'SIMULATED_SQS_OUTAGE',
+              next_attempt_at = now() - interval '1 hour'`,
+    );
+
+    // §3 ("não perder eventos confirmados") e §11 ("sem perder nem duplicar
+    // indefinidamente"): sem teto de tentativas na seleção, o evento volta a
+    // ser reivindicado e é publicado quando o transporte se recupera.
+    const publisher = new RecordingPublisher(realPublisher());
+    const result = await publish(new Date(), publisher);
+
+    expect(result).toMatchObject({
+      claimed: total,
+      published: total,
+      failed: 0,
+    });
+
+    const published = await readOutboxRows();
+    for (const row of published) {
+      expect(row.status).toBe('PUBLISHED');
+      expect(row.attempts).toBe(11);
+      expect(row.last_error).toBeNull();
+      expect(row.published_at).not.toBeNull();
+    }
+
+    const received = await receiveMessages();
+    expect(received.map((m) => m.body).sort(byEventId)).toEqual(
+      published.map((row) => row.payload).sort(byEventId),
     );
   }, 30_000);
 

@@ -1005,17 +1005,64 @@ inalterado; nenhum push, `git reset`, `git clean`, reinstalação ou deploy.
 
 ---
 
+## Entrega de emergência — correções de auditoria (25/10/2026)
+Escopo deliberadamente mínimo: defeitos confirmados de risco financeiro e o
+requisito obrigatório pendente (§12), sem refatoração nem novos recursos.
+
+1. **BUG-03 — perda de eventos confirmados da outbox (corrigido).** O claim
+   (`OutboxMessageRepository.claimPublishable`) filtrava `attempts < 10`:
+   esgotado o orçamento, a mensagem `PENDING` nunca mais era reivindicada e o
+   evento confirmado no commit se perdia para sempre — violação direta de §3
+   ("não perder eventos confirmados") e §11 ("sem perder nem duplicar
+   indefinidamente"). Correção: remoção do teto de tentativas na seleção; o
+   backoff (`5 s × 2^(n−1)`, teto 15 min) passa a limitar só a cadência. O
+   teste unitário que fixava o comportamento com defeito ("só reivindica
+   mensagens com tentativas sobrando") foi **substituído** pelo comportamento
+   correto ("publica também a mensagem com tentativas já esgotadas"), e o
+   cenário novo em PostgreSQL real cobre a recuperação
+   (`outbox-publisher.integration`).
+2. **BUG-02 — elegibilidade da WIN (sem mudança de comportamento).** Conferido
+   no código e contra o README oficial: a regra 2 resolve a referência por
+   chave + identidade (provider, player, wallet, moeda, rodada) e **não**
+   impõe condição de status/kind ao alvo — a exigência de `BET` `PROCESSED`
+   vale apenas para `REFUND`/`ROLLBACK` (tabela §7 + regra 3), e o efeito da
+   `WIN` é crédito com referência **opcional**. O crédito em todos os cenários
+   da auditoria (BET `REJECTED`, `LOSS`, `REFUND`, BET `PROCESSED`, alvo ainda
+   `PENDING_REFERENCE`) é o comportamento deliberado e documentado
+   (`ARCHITECTURE.md`, "Decisão — política de referência do `WIN`", item 3);
+   restringir exigiria inventar regra sem respaldo no desafio. Adicionados 4
+   testes de regressão que fixam a política e seus limites (identidade
+   divergente continua `REFERENCE_MISMATCH`).
+3. **BUG-04/05 — erros permanentes (corrigido).** `http-errors.ts`:
+   `CURRENCY_MISMATCH`/`WALLET_PLAYER_MISMATCH` deixam de cair em 503
+   (transitório) e passam a 400; violação de unique responde 409 com código
+   estável (`UNIQUE_CONSTRAINT_VIOLATION`); o fallback 503 responde
+   `INTERNAL_ERROR` — mensagens internas do banco não são mais expostas.
+   `consumer-error.ts`: payload permanentemente inválido (`INVALID_*`,
+   validações de domínio, divergências de identidade) vira permanente (DLQ
+   imediata), eliminando retentativas inúteis. 23 testes novos.
+4. **Observabilidade (README §12) — implementada no mínimo do contrato.**
+   Logs estruturados em JSON (`logEvent` + `JsonLogger` registrado em
+   `main.ts`) com `correlationId`, `messageId`, `transactionId`, `walletId` e
+   `providerId`, sem payload financeiro; métricas em memória
+   (`src/infrastructure/observability/metrics.ts`) expostas em `GET /metrics`,
+   cobrindo transações por status, duplicatas, retries, DLQ, conflitos de
+   lock, outbox lag e latência de processamento. Limitação honesta: registro
+   por processo, sem agregação entre instâncias (ver `ARCHITECTURE.md`).
+
+---
+
 ## Validações
-Resultados da última execução completa, feita na entrega final (após os testes
-entre processos):
+Resultados da última execução completa, feita na entrega de emergência
+(após as correções de auditoria e a observabilidade):
 
 | Comando | Resultado |
 |---|---|
-| `bun run test` | 258 testes, 22 arquivos — todos passando (exit 0) |
-| `bun run lint` | exit 0, sem diagnósticos |
+| `bun run test` | 289 testes, 25 arquivos — todos passando (exit 0) |
+| `bun run lint` | exit 0, 2 warnings pré-existentes (`require-array-sort-compare` em `outbox-publisher.integration`), nenhum novo |
 | `bunx tsc --noEmit` | exit 0, sem saída |
 | `bun run build` | exit 0 |
-| `bun run test:integration` | 10 arquivos, 92 testes — passando (exit 0) |
+| `bun run test:integration` | 10 arquivos, 93 testes — passando (exit 0) |
 
 Baselines: antes da entrega final, 248 unitários e 81 de integração (9
 arquivos); antes da Fase 13, `bun run test` com 143 testes em 9 arquivos e
@@ -1051,8 +1098,10 @@ app.controller) + 92 de integração (8 PostgreSQL + 8 concorrência + 10 WIN +
    comprovada (etapa final), assim como a entre transações/conexões de um
    processo (Fase 8) e entre instâncias dos workers; faltam ≥3 processos ao
    mesmo tempo e o teste de reinício.
-2. **Observabilidade (§12)** — logs JSON estruturados com IDs de correlação e
-   métricas operacionais não implementados (liveness/readiness estão prontos).
+2. **Observabilidade (§12)** — implementada no mínimo do contrato na entrega
+   de emergência (logs JSON estruturados e métricas em `GET /metrics`);
+   persiste a limitação de o registro ser **por processo**, sem agregação
+   entre instâncias (exporter/OTel é opcional no §12).
 3. **Consumidor da fila de eventos** da outbox (§11, passo 5) não
    implementado — quem torna a duplicata de publicação segura do lado dos
    eventos.
@@ -1072,6 +1121,7 @@ Em ordem de dependência (detalhamento em `PLAN.md`):
    transacional).
 2. **Testes com ≥3 processos/instâncias simultâneos** e com **reinício do
    serviço** — encerra a frente de concorrência e idempotência.
-3. **Observabilidade (§12)** — logs JSON com IDs de correlação e métricas.
+3. ~~**Observabilidade (§12)** — logs JSON com IDs de correlação e métricas.~~
+   Concluída no mínimo do contrato (entrega de emergência).
 4. **Consumidor da fila de eventos** da outbox (§11, passo 5).
 5. **Corrigir `bun run test:e2e`** (configuração do scaffold NestJS).
