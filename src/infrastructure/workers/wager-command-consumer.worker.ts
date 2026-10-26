@@ -230,9 +230,11 @@ export class WagerCommandConsumerWorker
       }
 
       // §12: log estruturado por mensagem, com os identificadores do fluxo —
-      // sem payload financeiro.
+      // sem payload financeiro. `correlationId` casa com o valor gravado nos
+      // eventos da outbox desta transação (§11); quando o desfecho não tem
+      // transação (ex.: duplicata da Inbox), o `messageId` faz a correlação.
       logEvent('log', 'command_processed', {
-        correlationId: message.messageId,
+        correlationId: outcome.transactionId ?? message.messageId,
         messageId: message.messageId,
         transactionId: outcome.transactionId,
         walletId: envelope.data.walletId,

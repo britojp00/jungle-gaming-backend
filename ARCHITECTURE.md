@@ -270,6 +270,29 @@ adicionaria semântica. O `ProcessBetUseCase` grava o valor do enum
 (`FailureCode.INSUFFICIENT_FUNDS`): a representação persistida continua
 sendo a string da coluna, sem literais duplicados no caso de uso.
 
+## Escolha do ORM e estratégia transacional (README §4)
+O §4 exige justificar a escolha do ORM, o mapeamento do `Money` e a
+estratégia transacional:
+
+- **ORM: MikroORM** (a opção preferencial do §4). Por quê: Unit of Work e
+  Identity Map explícitos, `em.transactional()` para aninhar os casos de uso
+  numa única transação, `LockMode` para o lock pessimista por wallet
+  (`WalletRepository.findByIdForUpdate` → `SELECT … FOR UPDATE`), e
+  migrations versionadas com `up()`/`down()` testados em banco real. Prisma
+  está fora do escopo do desafio e TypeORM não foi necessário.
+- **Mapeamento do `Money`:** valor e moeda em colunas separadas
+  (`amount numeric(20,2)` + `currency`), representados como **string** nas
+  entidades — nunca `number`/`float`. A leitura devolve `MoneyProps` e o
+  domínio reidrata com `Money.from`, mantendo a representação exata (§6.1);
+  o domínio não conhece tipos do ORM nem do NestJS.
+- **Estratégia transacional:** **uma transação SQL por operação**
+  (`em.transactional` com um `flush`), contendo transação + saldo + ledger +
+  inbox + outbox — é a atomicidade exigida pela §11, provada por rollback
+  real nos testes. A unidade de concorrência é a `walletId` (§8): o lock
+  `FOR UPDATE` é **por wallet**, adquirido dentro dessa mesma transação —
+  nunca um lock global. A invariante `balance == ledger` é reforçada por
+  constraints e trigger no banco, não só em código (§5.9).
+
 ## Persistência e constraints (`src/migrations/Migration20261024021931_InitialSchema.ts`)
 Colunas monetárias são sempre `numeric(20,2)` (nunca `float`/`double`).
 
@@ -797,6 +820,38 @@ dashboard são opcionais):
 - **health checks** — já existentes e separados (`/health/live`,
   `/health/ready`).
 
+## Modelagem de eventos — adaptação deliberada (§6.5 e §11)
+O README oficial define `IntegrationEvent<T>` (classe abstrata com uma
+subclasse por evento) e `OutboxMessage` (classe de domínio com
+`enqueue`/`markPublished`/`scheduleRetry`). O **§6 (cabeçalho)** autoriza
+adaptar: "Nomes e assinaturas podem ser adaptados, desde que as garantias
+sejam preservadas", e o **§6.0** classifica os blocos como "esqueletos de
+referência: o que importa é que o estado seja encapsulado e as transições
+sejam explícitas".
+
+**Decisão:** não replicar as classes literalmente; preservar as garantias.
+O que está verificado:
+
+- o payload gravado na outbox é exatamente o `toJSON()` do esqueleto —
+  `eventId`, `eventType`, `aggregateId`, `correlationId`, `occurredAt`
+  (ISO-8601), `version` e `data` (`persistOutboxEvent`, em
+  `process-support.ts`);
+- `data` carrega `MoneyProps` (string decimal), **nunca** a instância de
+  `Money`; `causationId` é opcional no contrato e não é usado;
+- o estado e as transições do `OutboxMessage` (§6.5) existem em
+  `OutboxMessageEntity` + `OutboxMessageRepository`: `isPending` (`status`),
+  `isDue` (`next_attempt_at <= now`), `markPublished` e a tentativa com
+  backoff gravadas no claim.
+
+**Proposta (não implementada — refatoração ampla, fora de escopo):**
+hierarquia `IntegrationEvent<T>` abstrata com uma subclasse concreta por
+evento (`WagerTransactionProcessed`, `WagerTransactionRejected`,
+`WalletBalanceChanged`, `WagerTransactionPendingReference`) e
+`OutboxMessage.enqueue(event)` como única porta de gravação. Ganho: o
+`eventType`/`version` passam a viver no tipo, e não em uma string no call
+site. Custo: tocar todos os casos de uso e os testes que fixam o payload —
+a fazer em etapa própria, com a suíte completa como rede de segurança.
+
 ## Contrato do evento `WalletBalanceChanged` (README §11)
 Aplicado por `OpenWalletUseCase`, `ProcessBetUseCase` e `ProcessWinUseCase`:
 
@@ -963,8 +1018,9 @@ PostgreSQL e SQS — a garantia é da persistência (§5.2). Implementados: o
 `(consumerName, messageId)`, Inbox + efeitos + ledger + outbox na **mesma
 transação**, `ack` somente depois do commit, DLQ para erros permanentes e
 reentrega por visibilidade para os transitórios (`maxReceiveCount` decide o
-limite). **Continua faltando** a observabilidade (§12) e o consumidor dos
-**eventos** da outbox (quem torna a duplicata de publicação segura, §11:5).
+limite). **Continua faltando** o consumidor dos **eventos** da outbox (quem
+torna a duplicata de publicação segura, §11:5); a observabilidade (§12) está
+implementada no mínimo do contrato (seção própria acima).
 
 ### Riscos pendentes
 - **`WalletRepository.create`** (`src/infrastructure/persistence/repositories/wallet.repository.ts`)
@@ -973,24 +1029,49 @@ limite). **Continua faltando** a observabilidade (§12) e o consumidor dos
   atuais, mas é um caminho inseguro que precisa ser removido ou corrigido.
 
 ### Autenticação
-Opcional no desafio. Não implementar autenticação artesanal; se houver
-tempo, integrar um IdP externo/OIDC (ex.: Keycloak).
+**Decisão (README §2): não implementar** autenticação nesta entrega — o §2
+não pontua e ela não podia competir com correção financeira, concorrência,
+idempotência e mensageria. Nada de autenticação artesanal (sem tabela de
+usuários, sem hash de senha).
+
+**Desenho que seria adotado:** integrar um **IdP externo/OIDC** (Keycloak ou
+Zitadel, ambos sobem em Docker Compose); os endpoints de negócio passariam a
+validar o JWT de acesso no `AuthGuard`; `/health/live` e `/health/ready`
+continuam **abertos** (§2); a identidade do provedor dentro das mensagens da
+fila segue sujeita às mesmas validações de domínio — uma
+`ProviderIdentityPort` extrairia essa identidade do envelope, hoje lida
+diretamente de `data.providerId`.
+
+**Ponto de extensão explícito no código:** `src/http/auth.guard.ts`
+(`AuthGuard` no-op, registrado como `APP_GUARD` em `app.module.ts`) — a troca
+por um guard real acontece ali, sem tocar nos controllers. Contrato HTTP
+inalterado.
 
 ### Observabilidade
-Planejado: logs JSON com IDs de correlação, sem segredos nem payloads
-financeiros completos, e métricas de transações, duplicatas, retries, DLQ,
-locks e atraso da outbox.
+Implementada no mínimo do §12: logs estruturados em JSON
+(`src/infrastructure/observability/structured-logger.ts`) com
+`correlationId`, `messageId`, `transactionId`, `walletId` e `providerId` nos
+pontos de processamento HTTP, no consumidor e na publicação da outbox — sem
+payload financeiro completo; métricas em `GET /metrics`
+(`src/infrastructure/observability/metrics.ts`), incluindo as divergências de
+reconciliação exigidas pela §9. **Limitação:** o registro de métricas é por
+processo — sem agregação entre instâncias (exporter/OTel é opcional).
 
 ### Testes ainda não cobertos
-Execução com **≥3 processos** de verdade (a concorrência do consumidor usa 3
-instâncias em um processo; entre processos, o teste próprio cobre **2**) e
-**reinício do serviço**; além da reversão (`down`) da migration inicial em
-banco real (a `down` de `PendingReferenceRetry` e das duas migrations de
-reversão já foi executada e conferida). Publicação (queda antes/depois do
-commit, dois publishers, retentativa) coberta em
+**Reinício do serviço em si** (subir o Nest completo com workers, derrubar com
+SIGTERM e subir de novo) — a recuperação **por nova instância** já é coberta
+em `multi-process.integration.e2e-spec.ts`: a instância que comitou termina
+sem publicar e um processo novo, com conexões próprias, drena a outbox para o
+SQS real e o estado final reconcilia (`wallet.balance == ledger`). **≥3
+processos simultâneos** também está coberto desde a última rodada (4
+processos disputando o mesmo saldo, com a invariante da §13). Continuam
+fora: o reinício com SIGTERM do serviço completo e a reversão (`down`) da
+migration inicial em banco real (a `down` de `PendingReferenceRetry` e das
+duas migrations de reversão já foi executada e conferida). Publicação
+(queda antes/depois do commit, dois publishers, retentativa) coberta em
 `outbox-publisher.integration.e2e-spec.ts`; consumo (reentrega sem duplicar,
 atomicidade, queda entre commit e ack, transitório até a DLQ, permanente à
 DLQ, concorrência entre instâncias) em
 `wager-command-consumer.integration.e2e-spec.ts`; concorrência, corrida de
-reversão e redelivery **entre processos independentes** em
-`multi-process.integration.e2e-spec.ts`.
+reversão, redelivery, ≥3 processos e recuperação por nova instância **entre
+processos independentes** em `multi-process.integration.e2e-spec.ts`.

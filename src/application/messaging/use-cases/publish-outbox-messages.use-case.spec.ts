@@ -200,6 +200,9 @@ describe('PublishOutboxMessagesUseCase — falha de publicação', () => {
         reason: 'PUBLISH_FAILED',
         messageId: MESSAGE_ID,
         eventType: 'WagerTransactionProcessed',
+        // Contexto para o log se cruzar com os eventos da mesma transação
+        // (§12) — o payload financeiro continua fora.
+        correlationId: MESSAGE_ID,
         detail: 'SQS indisponível',
       },
     ]);

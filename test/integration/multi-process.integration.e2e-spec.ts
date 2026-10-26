@@ -67,10 +67,17 @@ const BUN = execFileSync(
   .filter(Boolean)[0]!;
 
 function spawnChild(payload: Record<string, unknown>): ChildProcessWithoutNullStreams {
-  // O DATABASE_URL vai pelo ambiente — nenhuma credencial em argv ou log.
+  // O DATABASE_URL e as credenciais SQS vão pelo ambiente — nada em argv ou log.
   return spawn(BUN, [RUNNER, JSON.stringify(payload)], {
     cwd: process.cwd(),
-    env: { ...process.env, DATABASE_URL: integrationEnv.databaseUrl },
+    env: {
+      ...process.env,
+      DATABASE_URL: integrationEnv.databaseUrl,
+      SQS_ENDPOINT: integrationEnv.sqsEndpoint,
+      AWS_REGION: integrationEnv.region,
+      AWS_ACCESS_KEY_ID: integrationEnv.accessKeyId,
+      AWS_SECRET_ACCESS_KEY: integrationEnv.secretAccessKey,
+    },
     stdio: ['pipe', 'pipe', 'pipe'],
   });
 }
@@ -207,6 +214,37 @@ function betPayload(walletId: string, playerId: string, amount: string) {
     roundId: 'round-987',
     gameId: 'fortune-chimp',
   };
+}
+
+/**
+ * Invariante final exigida pela §13 (`wallet.balance == saldo reconstruído
+ * pelo ledger`), calculada de forma independente: lê os lançamentos por SQL e
+ * reconstrói o saldo com `Money` (sem ponto flutuante).
+ */
+async function expectWalletReconciled(walletId: string): Promise<void> {
+  const stored = Money.from({
+    amount: (await walletRow(walletId)).balance,
+    currency: 'BRL',
+  });
+  const entries = (await readRows(
+    `select direction, amount, currency from wallet_ledger_entries
+      where wallet_id = '${walletId}' order by created_at, id`,
+  )) as Array<{ direction: string; amount: string; currency: string }>;
+
+  let reconstructed = Money.zero('BRL');
+
+  for (const entry of entries) {
+    const amount = Money.from({
+      amount: entry.amount,
+      currency: entry.currency,
+    });
+    reconstructed =
+      entry.direction === 'CREDIT'
+        ? reconstructed.add(amount)
+        : reconstructed.subtract(amount);
+  }
+
+  expect(reconstructed.equals(stored)).toBe(true);
 }
 
 function reversalPayload(
@@ -439,5 +477,112 @@ describe('Redelivery de comando sem duplicar efeitos (§10)', () => {
 
     const inbox = await readRows(`select * from inbox_messages`);
     expect(inbox).toHaveLength(1);
+  }, 60_000);
+});
+
+describe('≥3 processos simultâneos (§13.4)', () => {
+  it('quatro processos disputam o mesmo saldo: um débito só, saldo 20.00', async () => {
+    const playerId = `mp-three-plus-${randomUUID()}`;
+    const wallet = await openWallet(playerId, '100.00');
+
+    const results = await runProcesses(
+      Array.from({ length: 4 }, () => ({
+        operation: 'bet',
+        payload: betPayload(wallet.id, playerId, '80.00'),
+      })),
+    );
+
+    // Exatamente uma aposta processada; as demais, por saldo insuficiente.
+    const processed = results.filter((result) => result['status'] === 'PROCESSED');
+    const rejected = results.filter((result) => result['status'] === 'REJECTED');
+    expect(processed).toHaveLength(1);
+    expect(rejected).toHaveLength(3);
+
+    for (const result of rejected) {
+      expect(result['failureCode']).toBe('INSUFFICIENT_FUNDS');
+    }
+
+    const walletState = await walletRow(wallet.id);
+    expect(walletState.balance).toBe('20.00');
+
+    const debits = (await readRows(
+      `select amount from wallet_ledger_entries
+        where wallet_id = '${wallet.id}' and direction = 'DEBIT'`,
+    )) as Array<{ amount: string }>;
+    expect(debits).toHaveLength(1);
+    expect(debits[0]!.amount).toBe('80.00');
+
+    // §13: invariante final — saldo materializado == ledger reconstruído.
+    await expectWalletReconciled(wallet.id);
+  }, 60_000);
+});
+
+describe('Recuperação após queda da instância (§11, passos 2-4; §13)', () => {
+  it('instância morre após o commit; nova instância publica o pendente e o estado reconcilia', async () => {
+    const playerId = `mp-recovery-${randomUUID()}`;
+    const wallet = await openWallet(playerId, '100.00');
+
+    const admin = createSqsHttp();
+    const eventsQueueUrl = await admin.createQueue(
+      `jungle-integration-mp-events-${randomUUID().slice(0, 8)}.fifo`,
+      true,
+    );
+
+    // Instância 1: aplica a BET e **termina** — o commit aconteceu e a
+    // publicação não (é o estado de quem morre entre o commit e o publish).
+    const first = await runProcesses([
+      { operation: 'bet', payload: betPayload(wallet.id, playerId, '25.00') },
+    ]);
+    expect(first[0]!['status']).toBe('PROCESSED');
+
+    const pending = await readRows(
+      `select status, event_type from outbox_messages`,
+    );
+    expect(pending.length).toBeGreaterThan(0);
+    for (const row of pending) {
+      expect(row['status']).toBe('PENDING');
+    }
+
+    // O broker ainda não recebeu nada.
+    const client = new SqsClient({
+      endpoint: integrationEnv.sqsEndpoint,
+      region: integrationEnv.region,
+      accessKeyId: integrationEnv.accessKeyId,
+      secretAccessKey: integrationEnv.secretAccessKey,
+    });
+    expect(
+      await client.receiveMessages({ queueUrl: eventsQueueUrl }),
+    ).toEqual([]);
+
+    // Instância NOVA assume o trabalho pendente e drena a outbox — é o que o
+    // serviço reiniciado faz pelo worker de publicação (§11: "outra instância
+    // assume o trabalho; o evento é publicado").
+    const second = await runProcesses([
+      { operation: 'publish-outbox', payload: { queueUrl: eventsQueueUrl } },
+    ]);
+    expect(second[0]).toMatchObject({
+      claimed: pending.length,
+      published: pending.length,
+      failed: 0,
+    });
+
+    const after = await readRows(`select status from outbox_messages`);
+    for (const row of after) {
+      expect(row['status']).toBe('PUBLISHED');
+    }
+
+    // Os eventos confirmados chegaram ao SQS real.
+    const received = await client.receiveMessages({ queueUrl: eventsQueueUrl });
+    expect(received).toHaveLength(pending.length);
+
+    // Estado final consistente depois da queda e da retomada (§13).
+    await expectWalletReconciled(wallet.id);
+
+    // O processamento continua correto na instância seguinte.
+    const third = await runProcesses([
+      { operation: 'bet', payload: betPayload(wallet.id, playerId, '20.00') },
+    ]);
+    expect(third[0]!['status']).toBe('PROCESSED');
+    await expectWalletReconciled(wallet.id);
   }, 60_000);
 });

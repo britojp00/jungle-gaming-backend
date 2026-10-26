@@ -1052,17 +1052,60 @@ requisito obrigatório pendente (§12), sem refatoração nem novos recursos.
 
 ---
 
+## Correções finais orientadas pela auditoria (Etapas 1-5)
+1. **Métrica de divergência de reconciliação (§9)** — confirmado omissão do
+   requisito ("contabilizadas em métrica"): `reconciliation_divergences_total`
+   em `ReconcileWalletUseCase`, incrementada **somente** quando
+   `consistent === false`. 4 testes unitários (divergência, ausência de
+   divergência, acúmulo e wallet inexistente). Comportamento financeiro da
+   resposta inalterado (campos conferidos item a item).
+2. **Testes de concorrência e recuperação (§13)** — a infra multiprocesso
+   (`support/child-runner.ts` + `runProcesses`) já era reutilizável para N
+   processos; foram acrescentados dois cenários em
+   `multi-process.integration.e2e-spec.ts`: **4 processos simultâneos**
+   disputando o mesmo saldo (§13.4 — um débito só, sem saldo negativo) e
+   **recuperação por nova instância** (a instância que comitou termina sem
+   publicar; um processo novo drena a outbox para o SQS real e o estado final
+   reconcilia — `wallet.balance == ledger`, invariante nova do spec). O
+   `child-runner` ganhou a operação `publish-outbox` (credenciais só via
+   ambiente, nunca argv). **Não coberto:** reinício do serviço Nest completo
+   (SIGTERM + workers) — registrado como limitação, sem simulação barata.
+3. **Logs estruturados (§12)** — `transaction_submitted` no processamento
+   HTTP com `correlationId`, `messageId`, `transactionId`, `walletId` e
+   `providerId`; `correlationId` dos logs passou a ser **o mesmo valor
+   persistido nos eventos da outbox** (o `transactionId` da operação, como os
+   testes fixam) em vez do id da mensagem; `correlationId` entrou no problema
+   de publicação da outbox (mesma linha de log estruturada, sem duplicar).
+   4 testes focados (formato do `logEvent` e campos/não-exposição do log HTTP).
+4. **Documentação (§2/§4/§14)** — README: removida a afirmação falsa de
+   alterações locais não commitadas; métricas/logs marcados como
+   implementados; política real da outbox (entrega eventual, sem teto de
+   tentativas); **uso real de Bun, Node e Vitest** documentado (produção executa
+   `node dist/main`, então Bun não é o runtime de produção — divergência do §4
+   assumida). ARCHITECTURE: autenticação (decisão + desenho + `AuthGuard`
+   no-op registrado via `APP_GUARD` como ponto de extensão, §2) e justificativa
+   de ORM/Money/estratégia transacional (§4).
+5. **Modelagem de eventos (§6.5/§11)** — analisada antes de qualquer
+   refatoração: o §6 (cabeçalho) e o §6.0 classificam os blocos como
+   "esqueletos de referência" adaptáveis, logo `IntegrationEvent`/`OutboxMessage`
+   **não** são obrigatórios como classes literais; as garantias do envelope
+   (campos, `data` em `MoneyProps`, transições do estado da outbox) estão
+   preservadas. A proposta de hierarquia tipada ficou registrada em
+   `ARCHITECTURE.md` como trabalho futuro.
+
+---
+
 ## Validações
 Resultados da última execução completa, feita na entrega de emergência
 (após as correções de auditoria e a observabilidade):
 
 | Comando | Resultado |
 |---|---|
-| `bun run test` | 289 testes, 25 arquivos — todos passando (exit 0) |
+| `bun run test` | 298 testes, 29 arquivos — todos passando (exit 0) |
 | `bun run lint` | exit 0, 2 warnings pré-existentes (`require-array-sort-compare` em `outbox-publisher.integration`), nenhum novo |
 | `bunx tsc --noEmit` | exit 0, sem saída |
 | `bun run build` | exit 0 |
-| `bun run test:integration` | 10 arquivos, 93 testes — passando (exit 0) |
+| `bun run test:integration` | 10 arquivos, 95 testes — passando (exit 0) |
 
 Baselines: antes da entrega final, 248 unitários e 81 de integração (9
 arquivos); antes da Fase 13, `bun run test` com 143 testes em 9 arquivos e
@@ -1080,7 +1123,7 @@ final somou 10 unitários (2 arquivos novos: `process-support.spec.ts` e
 testes de integração e acrescentou 3 testes entre processos (1 arquivo novo
 mais o runner infantil).
 
-Distribuição atual: 258 unitários (money, wallet, wallet-ledger-entry,
+Distribuição atual: 298 unitários (money, wallet, wallet-ledger-entry,
 wager-transaction, payload-hash, open-wallet, process-bet, process-win,
 **reference-retry-policy**, **resolve-pending-references**,
 **pending-reference.worker**, **publish-outbox-messages**,
@@ -1088,16 +1131,18 @@ wager-transaction, payload-hash, open-wallet, process-bet, process-win,
 **wager-transaction-requested**, **receive-wager-transaction**,
 **wager-command-consumer.worker**, **inbox-message**,
 **inbox-message.repository**, **process-support**, **process-reversal**,
-app.controller) + 92 de integração (8 PostgreSQL + 8 concorrência + 10 WIN +
-**10 referência pendente** + **7 outbox** + **6 consumo de comandos** + 4 SQS
-+ **16 HTTP** + **20 reversões** + **3 entre processos**).
+**reconcile-wallet**, **wagering.controller**, **auth.guard**,
+**structured-logger**, **metrics**, **http-errors**, **consumer-error**,
+app.controller) + 95 de integração (8 PostgreSQL + 8 concorrência + 10 WIN +
+**10 referência pendente** + **8 outbox** + **6 consumo de comandos** + 4 SQS
++ **16 HTTP** + **20 reversões** + **5 entre processos**).
 
 ## Limitações que permanecem
-1. **≥3 processos/instâncias simultâneos e reinício do serviço não
-   testados** — a concorrência entre **2 processos independentes** está
-   comprovada (etapa final), assim como a entre transações/conexões de um
-   processo (Fase 8) e entre instâncias dos workers; faltam ≥3 processos ao
-   mesmo tempo e o teste de reinício.
+1. **Reinício do serviço não testado** — a concorrência entre **2 e 4
+   processos independentes** está comprovada (§8 e §13.4), a **recuperação
+   por nova instância** também (outbox drenada por processo novo, com
+   `balance == ledger`), mas o **reinício do Nest completo** (SIGTERM + nova
+   subida com workers) segue sem teste; não foi simulado com atalho.
 2. **Observabilidade (§12)** — implementada no mínimo do contrato na entrega
    de emergência (logs JSON estruturados e métricas em `GET /metrics`);
    persiste a limitação de o registro ser **por processo**, sem agregação
@@ -1119,8 +1164,9 @@ Em ordem de dependência (detalhamento em `PLAN.md`):
 
 1. **Decidir o destino de `WalletRepository.create`** (remover ou tornar
    transacional).
-2. **Testes com ≥3 processos/instâncias simultâneos** e com **reinício do
-   serviço** — encerra a frente de concorrência e idempotência.
+2. **Reinício do serviço** (SIGTERM + nova subida do Nest completo com
+   workers) — ≥3 processos e a recuperação por nova instância já estão
+   cobertos; encerra a frente de concorrência e idempotência.
 3. ~~**Observabilidade (§12)** — logs JSON com IDs de correlação e métricas.~~
    Concluída no mínimo do contrato (entrega de emergência).
 4. **Consumidor da fila de eventos** da outbox (§11, passo 5).

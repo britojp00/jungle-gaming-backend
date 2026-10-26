@@ -15,6 +15,24 @@ Processar apostas e resultados com precisão monetária, concorrência segura, i
 - AWS SQS + LocalStack
 - Docker Compose
 
+### Uso real de Bun, Node e Vitest (§4)
+O requisito oficial pede Bun 1.x como runtime, package manager e test runner.
+O que o projeto usa **de fato**, sem maquiagem:
+
+| Papel | Ferramenta real | Comando |
+|---|---|---|
+| package manager | **Bun** | `bun install` |
+| executor de scripts | **Bun** | `bun run …` |
+| runtime de produção | **Node** | `bun run start:prod` executa `node dist/main` (o script `start:prod` é literalmente `node dist/main`; `start:dev` roda via `nest start`, também Node) |
+| test runner | **Vitest** sobre processos **Node** | `bun run test`, `bun run test:integration` |
+| runtime das migrations | **Bun** | `bun --bun run migration:up` (o CLI do MikroORM carrega `enum` de TypeScript, que o modo strip-only do Node não aceita) |
+| processos dos testes multiprocesso | **Bun** | `test/integration/support/child-runner.ts` roda como `bun child-runner.ts …` pelo mesmo motivo |
+
+Ou seja: Bun é o package manager/executor e o runtime dos pontos que dependem
+de `enum` em TypeScript; **a aplicação em produção e a suíte de testes rodam
+sobre Node**. A divergência em relação ao runtime exigido pelo §4 é assumida
+e registrada aqui e em `ARCHITECTURE.md`.
+
 ## Princípios
 - Dinheiro como string decimal, nunca `number` ou float.
 - Saldo, ledger, transação e outbox devem ser consistentes atomicamente.
@@ -45,17 +63,18 @@ financeiro (§7), mensageria (§10/§11) e recuperação após falhas.
 | Worker de referências pendentes (§7.1) | implementado: backoff exponencial (5 s × 2^(n−1), teto 15 min), 10 tentativas e TTL de 6 h, claim `FOR UPDATE SKIP LOCKED`, rejeição atômica `REFERENCE_NOT_FOUND`; validado em PostgreSQL real com 2 instâncias concorrentes e crashes |
 | LOSS, REFUND, ROLLBACK | implementados com as regras do §7: a referência precisa estar `PROCESSED`, `REFUND` só reverte `BET`, `ROLLBACK` reverte `BET`/`WIN`/`REFUND` e cada referência recebe no máximo **uma** reversão processada; a disputa de concorrência vira linha `REJECTED` de auditoria. Validado em PostgreSQL real, inclusive entre processos independentes |
 | Endpoints HTTP (§9) | implementados: 7 rotas de negócio (`POST /wallets`, `GET /wallets/:walletId`, `GET /wallets/:walletId/ledger`, `POST /wallets/:walletId/reconciliation`, `POST /wagering/transactions`, `GET /wagering/transactions/:transactionId`, `GET /providers/:providerId/wagering/transactions/:externalTransactionId`) + 2 de health, com mapeamento único de status (200/202/400/404/409/422/503) |
-| Publisher da outbox (§11) | implementado: o worker lê `outbox_messages`, publica em SQS e marca `PUBLISHED`; claim `FOR UPDATE SKIP LOCKED` com tentativa e janela gravadas antes de publicar, retentativas limitadas com backoff e desligamento gracioso; validado em PostgreSQL e LocalStack reais |
+| Publisher da outbox (§11) | implementado: o worker lê `outbox_messages`, publica em SQS e marca `PUBLISHED`; claim `FOR UPDATE SKIP LOCKED` com tentativa e janela gravadas antes de publicar, **entrega eventual** (sem teto de tentativas, backoff com teto de 15 min) e desligamento gracioso; validado em PostgreSQL e LocalStack reais |
 | Inbox, consumer SQS, DLQ | implementados: Inbox persistente por `messageId`, Inbox + efeitos + ledger + outbox em uma única transação, ACK só após o commit, DLQ em erro permanente e por `maxReceiveCount`; redelivery não duplica efeitos (validado entre processos) |
-| Liveness/readiness | implementados (`/health/live`, `/health/ready` com PostgreSQL e SQS); **métricas (§12) não implementadas** |
+| Liveness/readiness | implementados (`/health/live`, `/health/ready` com PostgreSQL e SQS) |
+| Observabilidade (§12) | implementada no mínimo do contrato: logs estruturados em JSON (`correlationId`, `messageId`, `transactionId`, `walletId`, `providerId`) e métricas em `GET /metrics` (transações por status, duplicatas, retries, DLQ, conflitos de lock, outbox lag, latência e **divergências de reconciliação**, §9). Limitação: registro por processo |
 
 Ter tabela, enum ou constraint prontos **não** significa que o fluxo de
 negócio está concluído. O detalhamento está em `PLAN.md` e
 `ACCEPTANCE_CHECKLIST.md`.
 
-**Importante:** o estado acima está no commit `5068354`. Há alterações locais
-ainda não commitadas sobre esse commit (regras de reversão do §7, índice único
-por referência e os testes entre processos); `PROGRESS.md` traz a cronologia.
+**Importante:** o estado acima corresponde ao histórico já commitado (último
+commit desta linha de trabalho: correções de auditoria sobre outbox, erros e
+observabilidade); `PROGRESS.md` traz a cronologia.
 
 ## Idempotência — algoritmo do `payloadHash` (README §9)
 O README oficial exige que o algoritmo do `payloadHash` esteja documentado.
@@ -138,8 +157,9 @@ varre `outbox_messages`, publica cada evento em SQS e marca `PUBLISHED`:
   publicação deixa a mensagem elegível de novo, sem perder;
 - corpo da mensagem = payload gravado na outbox, sem reescrita;
 - falha de publicação vira retentativa com o backoff já adotado (5 s ×
-  2^(n−1), teto 15 min), limitada a 10 tentativas — esgotadas, a mensagem
-  continua na tabela, auditável e **sem** estado novo nem fila morta;
+  2^(n−1), teto 15 min), **sem teto de tentativas**: o evento já foi
+  confirmado no commit, então ele é entregue de forma eventual (§3/§11) — o
+  teto limita a cadência, nunca a entrega;
 - desligamento gracioso: o timer para e o ciclo em andamento é aguardado.
 
 Variáveis (`.env.example`):
@@ -246,5 +266,6 @@ para um banco cujo nome não termine em `_integration`, antes de qualquer
 conexão ou `TRUNCATE`. Variáveis e valores ilustrativos: `.env.integration.example`.
 
 Ver `ARCHITECTURE.md` para a cobertura da suíte de integração e para as
-limitações que permanecem (≥3 processos simultâneos, reinício do serviço,
-observabilidade e o consumidor da fila de eventos).
+limitações que permanecem (**reinício do serviço Nest completo** — a
+recuperação por nova instância já é coberta —, registro de métricas por
+processo, o consumidor da fila de eventos e a `down` da migration inicial).

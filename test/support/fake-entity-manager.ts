@@ -119,24 +119,42 @@ export class FakeEntityManager {
     _options?: Row,
   ): Row | null {
     const rows = this.store.get(entityClass) ?? [];
-
-    const found = rows.find((row) =>
-      Object.entries(where).every(([key, value]) => {
-        const cell = row[key];
-
-        if (
-          cell !== null &&
-          typeof cell === 'object' &&
-          (cell as { __reference?: boolean }).__reference === true
-        ) {
-          return (cell as { id: string }).id === value;
-        }
-
-        return cell === value;
-      }),
-    );
+    const found = rows.find((row) => this.matches(row, where));
 
     return found ?? null;
+  }
+
+  /**
+   * `find` (plural) — a mesma semântica de filtro do `findOne`, devolvendo
+   * todas as linhas. `orderBy`/`limit` são aceitos e ignorados: o fake não
+   * simula paginação (quem cobre ordenação real é o PostgreSQL nos testes de
+   * integração).
+   */
+  find(
+    entityClass: Function,
+    where: Row,
+    _options?: Row,
+  ): Row[] {
+    const rows = this.store.get(entityClass) ?? [];
+
+    return rows.filter((row) => this.matches(row, where));
+  }
+
+  /** Filtro por coluna, resolvendo FK de relação pelo `id` (como o SQL faz). */
+  private matches(row: Row, where: Row): boolean {
+    return Object.entries(where).every(([key, value]) => {
+      const cell = row[key];
+
+      if (
+        cell !== null &&
+        typeof cell === 'object' &&
+        (cell as { __reference?: boolean }).__reference === true
+      ) {
+        return (cell as { id: string }).id === value;
+      }
+
+      return cell === value;
+    });
   }
 
   /**

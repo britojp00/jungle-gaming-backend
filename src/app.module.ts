@@ -1,10 +1,11 @@
 
 import { Module } from '@nestjs/common';
-import { APP_FILTER } from '@nestjs/core';
+import { APP_FILTER, APP_GUARD } from '@nestjs/core';
 import { MikroOrmModule } from '@mikro-orm/nestjs';
 import mikroOrmConfig from './mikro-orm.config.js';
 import { AppController } from './app.controller.js';
 import { AppService } from './app.service.js';
+import { AuthGuard } from './http/auth.guard.js';
 import { HealthController } from './http/health.controller.js';
 import { MetricsController } from './http/metrics.controller.js';
 import { WalletsController } from './http/wallets.controller.js';
@@ -30,6 +31,9 @@ import { SqsOutboxPublisher } from './infrastructure/sqs/sqs-outbox-publisher.js
     AppService,
     // Um único mapeamento de status HTTP para todos os endpoints (README §9).
     { provide: APP_FILTER, useClass: HttpExceptionFilter },
+    // Ponto de extensão de autenticação (README §2): guard no-op, trocado
+    // por um validador de JWT de IdP externo sem tocar nos controllers.
+    { provide: APP_GUARD, useClass: AuthGuard },
     PendingReferenceWorker,
     // Publicação da outbox (README §11): o publisher lê a fila e as
     // credenciais do ambiente (`.env.example`), então é montado aqui.

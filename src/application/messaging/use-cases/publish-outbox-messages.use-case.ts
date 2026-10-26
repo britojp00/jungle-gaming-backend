@@ -28,6 +28,13 @@ export interface OutboxPublishProblem {
   reason: 'PUBLISH_FAILED';
   messageId: string;
   eventType: string;
+  /**
+   * `correlationId` do envelope do evento (§11) — o mesmo valor que o caso
+   * de uso gravou na outbox, para que o log se cruze com os eventos daquela
+   * transação. Pode faltar em payload antigo; aí o campo fica `undefined` e
+   * some do log.
+   */
+  correlationId?: string;
   /** Mensagem do erro do transporte — nunca o payload financeiro. */
   detail: string;
 }
@@ -144,6 +151,10 @@ export class PublishOutboxMessagesUseCase {
           reason: 'PUBLISH_FAILED',
           messageId: message.id,
           eventType: message.eventType,
+          ...('correlationId' in message.payload &&
+          typeof message.payload['correlationId'] === 'string'
+            ? { correlationId: message.payload['correlationId'] }
+            : {}),
           detail,
         });
       }

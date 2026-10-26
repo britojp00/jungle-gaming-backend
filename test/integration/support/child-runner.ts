@@ -21,14 +21,18 @@ import {
   ProcessReversalUseCase,
 } from '../../../src/application/wagering/use-cases/process-reversal.use-case.js';
 import {
+  PublishOutboxMessagesUseCase,
+} from '../../../src/application/messaging/use-cases/publish-outbox-messages.use-case.js';
+import {
   ReceiveWagerTransactionUseCase,
 } from '../../../src/application/messaging/use-cases/receive-wager-transaction.use-case.js';
 import {
   parseWagerTransactionRequested,
 } from '../../../src/application/messaging/wager-transaction-requested.js';
+import { SqsOutboxPublisher } from '../../../src/infrastructure/sqs/sqs-outbox-publisher.js';
 
 interface ChildRequest {
-  operation: 'bet' | 'reversal' | 'consume';
+  operation: 'bet' | 'reversal' | 'consume' | 'publish-outbox';
   payload: Record<string, unknown>;
 }
 
@@ -75,6 +79,29 @@ async function main(): Promise<void> {
           request.payload as unknown as ProcessReversalInput,
         )) as unknown as Record<string, unknown>,
       );
+    } else if (request.operation === 'publish-outbox') {
+      // Recuperação por **nova instância** (§11, passos 2-4): a instância
+      // anterior confirmou os efeitos financeiros e terminou sem publicar;
+      // este processo, com conexões próprias, drena a outbox para o SQS real.
+      // Credenciais e endpoint vêm do ambiente (§ segredos: nunca por argv).
+      const queueUrl: unknown = request.payload['queueUrl'];
+      const publisher = new SqsOutboxPublisher({
+        endpoint: process.env['SQS_ENDPOINT'] ?? '',
+        queueUrl: typeof queueUrl === 'string' ? queueUrl : '',
+        region: process.env['AWS_REGION'] ?? 'us-east-1',
+        accessKeyId: process.env['AWS_ACCESS_KEY_ID'] ?? 'test',
+        secretAccessKey: process.env['AWS_SECRET_ACCESS_KEY'] ?? 'test',
+      });
+      const result = await new PublishOutboxMessagesUseCase(
+        em,
+        publisher,
+      ).execute({});
+
+      log({
+        claimed: result.claimed,
+        published: result.published,
+        failed: result.failed,
+      });
     } else {
       // Fluxo real do consumidor (§10) SEM o ack: é exatamente o estado em
       // que o processo morre depois do commit financeiro e antes da

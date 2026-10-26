@@ -35,6 +35,7 @@ import { WagerProcessResult } from '../application/wagering/process-support.js';
 import { WagerTransactionKind } from '../domain/wagering/wager-transaction.js';
 import { WagerTransactionEntity } from '../infrastructure/persistence/entities/wager-transaction.entity.js';
 import { WagerTransactionRepository } from '../infrastructure/persistence/repositories/wager-transaction.repository.js';
+import { logEvent } from '../infrastructure/observability/structured-logger.js';
 
 const IDEMPOTENCY_KEY_HEADER = 'idempotency-key';
 
@@ -113,6 +114,22 @@ export class WageringController {
     };
 
     const result = await this.dispatch(data, base);
+
+    // §12: log estruturado do processamento HTTP — só identificadores e
+    // resultado, nunca o payload financeiro. `correlationId` é o mesmo valor
+    // gravado no envelope dos eventos da outbox desta transação (a menos que
+    // o chamador informe outro), e `messageId` identifica a requisição pelo
+    // `Idempotency-Key` (§9) — o mesmo papel do envelope da fila (§10).
+    logEvent('log', 'transaction_submitted', {
+      correlationId: result.transactionId,
+      messageId: idempotencyKey,
+      transactionId: result.transactionId,
+      walletId: data.walletId,
+      providerId: data.providerId,
+      kind: data.kind,
+      status: result.status,
+      idempotentReplay: result.replayed,
+    });
 
     // README §9: o status distingue aceite com processamento pendente (202),
     // rejeição por regra de negócio (422), conflito de reversão já aplicada

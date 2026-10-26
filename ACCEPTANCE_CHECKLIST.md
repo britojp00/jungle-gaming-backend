@@ -16,9 +16,11 @@ Legenda de estado:
 > (`http.integration.e2e-spec.ts`) e a **concorrência entre processos
 > independentes** tem teste próprio desde a entrega final
 > (`multi-process.integration.e2e-spec.ts`: cenário §8 e corrida de reversão
-> entre dois processos, mais redelivery após commit em processo distinto).
-> Continuam abertos: execução com **≥3 processos simultâneos** e **reinício
-> do serviço**.
+> entre dois processos, mais redelivery após commit em processo distinto,
+> **quatro processos disputando o mesmo saldo** e **recuperação por nova
+> instância** — a instância que comitou termina e outra drena a outbox para o
+> SQS real, com `balance == ledger` conferido). Continua aberto: o
+> **reinício do serviço Nest completo** (SIGTERM + nova subida com workers).
 
 ---
 
@@ -96,8 +98,12 @@ Falha eliminatória se `number`/`float`/`double` representar dinheiro.
   §8 (duas apostas de `80.00` sobre `100.00` → uma `PROCESSED`, uma
   `REJECTED`, saldo `20.00`, **um** débito), a corrida `REFUND` × `ROLLBACK`
   sobre a mesma referência e o redelivery após commit sem duplicar efeitos.
-- **Falta demonstrar:** execução com **≥3 processos/instâncias simultâneos**
-  e **reinício do serviço**.
+- **Comprovado agora também:** **4 processos simultâneos** disputando o mesmo
+  saldo (§13.4 — um débito só, sem saldo negativo, `balance == ledger`) e a
+  **recuperação por nova instância** após a queda de quem comitou (a nova
+  instância publica o pendente no SQS real e o estado reconcilia).
+- **Falta demonstrar:** o **reinício do serviço** em si (subir o Nest
+  completo com workers, derrubar com SIGTERM e subir de novo).
 
 ### 6. Publicação de evento antes do commit — **Concluído**
 - **Implementado:** `OpenWalletUseCase`, `ProcessBetUseCase` e
@@ -168,7 +174,10 @@ Falha eliminatória se `number`/`float`/`double` representar dinheiro.
       `multi-process.integration.e2e-spec.ts`.
 - [x] Reconciliação entre saldo e ledger. — `ReconcileWalletUseCase` +
       `POST /wallets/:walletId/reconciliation`; acusa divergência (teste com
-      saldo materializado corrompido) sem alterar dados.
+      saldo materializado corrompido) sem alterar dados e, como a §9 exige,
+      **contabiliza cada divergência em métrica**
+      (`reconciliation_divergences_total`, testada em unidade) além de logar
+      e sinalizar na resposta.
 
 ## Concorrência — 20 pontos
 - [x] Duas apostas de 80 com saldo 100: uma aprovada, outra rejeitada, saldo 20. — `concurrency.integration.e2e-spec.ts` (também com 5 apostas concorrentes).
@@ -177,8 +186,10 @@ Falha eliminatória se `number`/`float`/`double` representar dinheiro.
 - [~] Testes com pelo menos três instâncias. — risco eliminatório 5:
       **2 processos independentes** já concorrem
       (`multi-process.integration.e2e-spec.ts` — §8, corrida de reversão e
-      redelivery após commit); **≥3 processos simultâneos** e reinício do
-      serviço continuam sem teste.
+      redelivery após commit) e agora há **4 processos simultâneos**
+      disputando o mesmo saldo (§13.4) mais a **recuperação por nova
+      instância** com `balance == ledger`; o **reinício do serviço** (SIGTERM
+      + nova subida do Nest completo) continua sem teste.
 
 ## Idempotência — 15 pontos
 - [x] 50 envios paralelos da mesma aposta geram um débito. — 1 transação, 1 débito, 49 replays; verificado por SQL em PostgreSQL real.
@@ -270,10 +281,10 @@ Falha eliminatória se `number`/`float`/`double` representar dinheiro.
       **mapeamento HTTP** está fechado em `src/http` (400/404/409/422/202/503).
 
 ## Testes — 10 pontos
-- [x] Testes unitários e de integração. — 289 unitários + 93 de integração (8 PostgreSQL + 8 concorrência + 10 WIN + 10 referência pendente + 8 outbox + 6 consumo de comandos + 4 SQS + 16 HTTP + 20 reversões + 3 entre processos).
+- [x] Testes unitários e de integração. — 298 unitários + 95 de integração (8 PostgreSQL + 8 concorrência + 10 WIN + 10 referência pendente + 8 outbox + 6 consumo de comandos + 4 SQS + 16 HTTP + 20 reversões + 5 entre processos).
 - [x] PostgreSQL e SQS reais nos testes de integração. — `compose.integration.yaml`; sem mocks nessa suíte.
 - [~] Migrations e constraints verificadas. — duas constraints, rollback e trigger de append-only verificados; `up` **e** `down` da `Migration20261024150000_PendingReferenceRetry` **e** das duas migrations de reversão (`Migration20261025120000_ReversalUniqueProcessed`, `Migration20261025160000_ReversalUniquePerReference`) executados no banco de integração; `down` da migration inicial continua não executado.
-- [~] Concorrência, reinício e publishers concorrentes testados. — concorrência entre transações/conexões testada em PostgreSQL real; **dois processos independentes** concorrendo de verdade (`multi-process.integration.e2e-spec.ts` — §8, corrida de reversão e redelivery após commit); **duas instâncias do worker de §7.1** drenando o mesmo lote com um único crédito por linha; **dois publishers concorrentes sobre a mesma outbox** (claim único por mensagem e nenhuma perdida — `outbox-publisher.integration.e2e-spec.ts`) e **três consumidores concorrentes** processando comandos sem duplicar nem perder (`wager-command-consumer.integration.e2e-spec.ts`). Entrega "exatamente uma vez" **não** é o que esses cenários comprovam: a garantia vem da Inbox persistente, da unique de idempotência e da atomicidade. **Reinício do processo** e **≥3 processos simultâneos** não testados (a queda entre commit e ack é recuperada por outra instância).
+- [~] Concorrência, reinício e publishers concorrentes testados. — concorrência entre transações/conexões testada em PostgreSQL real; **dois processos independentes** concorrendo de verdade (`multi-process.integration.e2e-spec.ts` — §8, corrida de reversão e redelivery após commit); **duas instâncias do worker de §7.1** drenando o mesmo lote com um único crédito por linha; **dois publishers concorrentes sobre a mesma outbox** (claim único por mensagem e nenhuma perdida — `outbox-publisher.integration.e2e-spec.ts`) e **três consumidores concorrentes** processando comandos sem duplicar nem perder (`wager-command-consumer.integration.e2e-spec.ts`). Entrega "exatamente uma vez" **não** é o que esses cenários comprovam: a garantia vem da Inbox persistente, da unique de idempotência e da atomicidade. **Quatro processos simultâneos** (§13.4) e a **recuperação por nova instância** (a que comitou termina; outra drena a outbox para o SQS real, com `balance == ledger`) também estão cobertos; o **reinício do serviço** (SIGTERM + nova subida do Nest completo) continua sem teste.
 
 ## Observabilidade — 5 pontos
 - [x] Logs JSON sem segredos. — `src/infrastructure/observability/structured-logger.ts`: `logEvent` (uma linha JSON por evento, com `correlationId`, `messageId`, `transactionId`, `walletId` e `providerId` nos pontos do consumidor) + `JsonLogger` registrado em `main.ts` para framework e workers; nenhum log carrega payload financeiro completo.
@@ -290,10 +301,10 @@ Falha eliminatória se `number`/`float`/`double` representar dinheiro.
    obrigatórios e fora de transação — caminho inseguro pendente de decisão.
 2. `bun run test:e2e` falha por problema conhecido de configuração do
    scaffold NestJS (enums em strip-only mode do Node 24).
-3. Execução com **≥3 processos/instâncias simultâneos** e **reinício do
-   serviço** — o que falta para encerrar de vez os riscos 4/5 e o item de
-   testes; a concorrência entre **2 processos independentes** já está
-   comprovada.
+3. **Reinício do serviço** (subir o Nest completo com workers, derrubar com
+   SIGTERM e subir de novo) — o que falta para encerrar de vez os riscos 4/5;
+   ≥3 processos simultâneos e a recuperação por nova instância já estão
+   comprovados em `multi-process.integration.e2e-spec.ts`.
 4. ~~Observabilidade (§12): logs JSON e métricas operacionais.~~ **Resolvido**
    nesta entrega: logs estruturados em JSON e métricas em `GET /metrics` (ver
    seção Observabilidade).

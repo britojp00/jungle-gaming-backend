@@ -7,6 +7,7 @@ import {
 } from '../../../infrastructure/persistence/entities/wallet-ledger-entry.entity.js';
 import { WalletEntity } from '../../../infrastructure/persistence/entities/wallet.entity.js';
 import { WalletLedgerRepository } from '../../../infrastructure/persistence/repositories/wallet-ledger.repository.js';
+import { metrics } from '../../../infrastructure/observability/metrics.js';
 
 export interface ReconcileWalletResult {
   walletId: string;
@@ -63,8 +64,10 @@ export class ReconcileWalletUseCase {
     const consistent = difference.isZero();
 
     if (!consistent) {
-      // §9: divergência não é corrigida silenciosamente — é logada e
-      // sinalizada na resposta. Métrica continua pendente (§12).
+      // §9: divergência não é corrigida silenciosamente — é logada,
+      // contabilizada em métrica e sinalizada na resposta. A contagem é só
+      // de divergência real: consulta consistente não incrementa nada.
+      metrics.increment('reconciliation_divergences_total');
       this.logger.warn(
         `reconciliação divergente da wallet ${walletId}: ` +
           `armazenado ${stored.toString()} x ledger ${calculated.toString()}`,
